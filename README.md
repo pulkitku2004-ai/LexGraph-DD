@@ -84,7 +84,7 @@ Hybrid retrieval (bge-m3 learned sparse + dense, fused with RRF k=60) gives a **
 ### 1. Clone and set up environment
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/legal-dd.git
+git clone https://github.com/pulkitku2004-ai/LexGraph-DD.git
 cd legal-dd
 
 python -m venv .venv
