@@ -1,0 +1,47 @@
+# Legal Due Diligence — direct dependencies
+# Generated 2026-04-14, Python 3.12
+
+# ── API & serving ──────────────────────────────────────────────────────────────
+fastapi==0.135.3
+uvicorn==0.44.0
+python-multipart==0.0.26
+pydantic==2.12.5
+pydantic-settings==2.13.1
+
+# ── LLM / embeddings ──────────────────────────────────────────────────────────
+litellm==1.83.4
+transformers==5.5.0
+torch==2.11.0
+huggingface_hub==1.9.1
+sentence-transformers==5.3.0
+tokenizers==0.22.2
+safetensors==0.7.0
+accelerate==1.13.0
+
+# ── Vector store ───────────────────────────────────────────────────────────────
+qdrant-client==1.17.1
+
+# ── Graph DB ───────────────────────────────────────────────────────────────────
+neo4j==6.1.0
+
+# ── Orchestration ──────────────────────────────────────────────────────────────
+langgraph==1.1.6
+langchain-core==1.2.27
+
+# ── Document ingestion ────────────────────────────────────────────────────────
+PyMuPDF==1.27.2.2
+python-docx==1.2.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+numpy==2.4.4
+httpx==0.28.1
+tenacity==9.1.4
+
+# ── UI (optional — only needed to run the Streamlit frontend) ─────────────────
+streamlit==1.56.0
+
+# ── Eval (optional — only needed to run eval/cuad_eval.py) ────────────────────
+datasets==4.8.4
+scikit-learn==1.8.0
+pandas==3.0.2

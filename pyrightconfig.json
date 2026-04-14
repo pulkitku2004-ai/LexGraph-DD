@@ -1,0 +1,6 @@
+{
+  "pythonPath": ".venv/bin/python3",
+  "extraPaths": ["legal_due_diligence"],
+  "venvPath": ".",
+  "venv": ".venv"
+}

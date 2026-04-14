@@ -1,0 +1,49 @@
+# Environment — contains API keys, never commit
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / models — too large for git
+*.pt
+*.bin
+*.safetensors
+eval/sample_ids.json
+eval/results/
+samples/
+
+# Claude Code local settings
+.claude/
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*.bak
