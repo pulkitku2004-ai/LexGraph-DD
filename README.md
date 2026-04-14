@@ -214,3 +214,9 @@ python eval/cuad_eval.py --n 400 --enrich-queries --multi-query
 ```
 
 Results saved to `eval/results/` as JSON.
+
+---
+
+## Engineering Notes
+
+For a deep dive into the sprint history, retrieval benchmarks, agent contracts, and design decisions, see [CONTEXT.md](CONTEXT.md).

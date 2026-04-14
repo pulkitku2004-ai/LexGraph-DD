@@ -26,16 +26,16 @@ Ingests 1–50 PDF/DOCX contracts → processes through 6 specialist agents orch
 | OS | macOS Darwin 25.3.0 |
 | Python | 3.12.1 (pyenv) |
 | Shell | zsh |
-| Virtual env | `/Users/dr_bolty/legal_dd/.venv` |
-| Project root | `/Users/dr_bolty/legal_dd/` |
-| Package root | `/Users/dr_bolty/legal_dd/legal_due_diligence/` |
+| Virtual env | `/path/to/legal_dd/.venv` |
+| Project root | `/path/to/legal_dd/` |
+| Package root | `/path/to/legal_dd/legal_due_diligence/` |
 
 **Every session — activate venv first:**
 ```bash
-source /Users/dr_bolty/legal_dd/.venv/bin/activate
+source /path/to/legal_dd/.venv/bin/activate
 ```
 
-**VS Code interpreter:** `/Users/dr_bolty/legal_dd/.venv/bin/python3`
+**VS Code interpreter:** `/path/to/legal_dd/.venv/bin/python3`
 **Pylance config:** `pyrightconfig.json` at project root — sets `extraPaths: ["legal_due_diligence"]` so imports resolve.
 
 ---
@@ -1078,10 +1078,10 @@ ERROR   → shows error list from state.errors, prompts to delete and retry
 
 ```bash
 # API — must use venv Python directly (uvicorn pyenv shim does NOT use venv packages)
-/Users/dr_bolty/legal_dd/.venv/bin/python -m uvicorn legal_due_diligence.api.main:app --port 8000
+/path/to/legal_dd/.venv/bin/python -m uvicorn legal_due_diligence.api.main:app --port 8000
 
 # UI
-/Users/dr_bolty/legal_dd/.venv/bin/python -m streamlit run legal_due_diligence/ui/app.py
+/path/to/legal_dd/.venv/bin/python -m streamlit run legal_due_diligence/ui/app.py
 ```
 
 **Critical:** `uvicorn` on this machine is a pyenv shim — it uses pyenv's system Python, not the venv. Running it directly causes `ModuleNotFoundError: No module named 'fitz'` in background tasks. Always use `python -m uvicorn` via the venv Python.
@@ -1566,7 +1566,7 @@ python eval/cuad_eval.py --enrich-queries
 
 ```bash
 # Environment
-source /Users/dr_bolty/legal_dd/.venv/bin/activate
+source /path/to/legal_dd/.venv/bin/activate
 
 # Infrastructure
 docker compose up -d
