@@ -43,6 +43,62 @@ PDF / DOCX / TXT
   FastAPI  ──►  Streamlit UI
 ```
 
+## Agents
+
+### 1. Health Check
+Pings Qdrant and Neo4j before any work begins and writes two boolean flags (`qdrant_ready`, `neo4j_ready`) into shared graph state. The LangGraph orchestrator reads these flags immediately and routes conditionally — if Qdrant is down the pipeline skips directly to the Report agent and documents what failed, rather than crashing. Partial results are more useful than a stack trace.
+
+### 2. Clause Extractor
+The most computationally intensive agent. For each document × each of the 41 CUAD clause categories, it:
+1. Embeds the category query with `bge-m3` to produce a dense (1024-dim) + learned sparse vector pair.
+2. Runs hybrid retrieval against Qdrant — dense cosine similarity + sparse SPLADE weights, fused with Reciprocal Rank Fusion (RRF k=60) — to find the most relevant chunks.
+3. Calls an LLM (`groq/llama-3.1-8b-instant`) with a structured prompt asking it to find the clause and return `{"found": bool, "clause_text": "...", "normalized_value": "...", "confidence": 0.0–1.0}`.
+
+All 41 categories are extracted **concurrently per document** (`asyncio.gather`), and all documents run concurrently too — a global `asyncio.Semaphore(10)` caps LLM concurrency to stay within Groq's rate limit. 10 categories with low recall also fire 2 alternative queries each (multi-query RRF) to overcome the vocabulary gap between CUAD category names and real contract language.
+
+Output: `list[ExtractedClause]` — one object per (document, category) pair.
+
+### 3. Risk Scorer
+Two-pass scoring — deterministic rules first, LLM reasoning second:
+
+- **Rules pass** (O(1), no LLM): flags missing high-stakes clauses (no Limitation of Liability → high risk), detects specific dangerous normalized values (uncapped liability, perpetual terms), and checks clause presence patterns.
+- **LLM reasoning pass** (8 nuanced categories only): for clauses where risk depends on *content* — indemnification scope, IP assignment breadth, termination triggers — the LLM reads the extracted clause text and returns a structured risk assessment.
+
+Output: `list[RiskFlag]` with `risk_level` (high / medium / low), a human-readable `reason`, and a `source_clause_id` that traces back to the originating chunk for citations.
+
+### 4. Entity Mapper
+Reads all extracted clauses and writes a structured knowledge graph into Neo4j using `MERGE` (fully idempotent — safe to re-run). The graph schema:
+
+```
+(Document)-[:HAS_CLAUSE]->(Clause)-[:INVOLVES]->(Party)
+                                               -[:GOVERNED_BY]->(Jurisdiction)
+                                               -[:LASTS]->(Duration)
+                                               -[:WORTH]->(MonetaryAmount)
+```
+
+Party names, jurisdictions, durations, and monetary amounts are extracted from `normalized_value` fields via lightweight regex + LLM. This graph is what makes cross-document contradiction detection possible — without it, documents are isolated blobs of text.
+
+Output: `graph_built: bool` in state. The actual data lives in Neo4j.
+
+### 5. Contradiction Detector
+Queries the Neo4j graph directly with two Cypher queries — it never re-reads extracted clauses from state:
+
+1. **Value conflicts**: `MATCH` clauses of the same type across different documents where `normalized_value` differs (e.g. Governing Law: *Delaware* vs *New York*).
+2. **Absence conflicts**: clause present in document A, missing in document B — structurally asymmetric obligations.
+
+Each detected conflict is passed to the LLM for a plain-English explanation written for a lawyer, not an engineer. If Neo4j is unavailable (`graph_built=False`), returns an empty list immediately — the report notes the skip.
+
+Output: `list[Contradiction]` with document pair, conflicting values, and explanation.
+
+### 6. Report + Q&A
+Terminal agent — reads the full state and produces two things:
+
+**Report**: A deterministic Python formatter builds the risk table and contradiction table first (no LLM, no failure mode). One LLM call then generates `{"executive_summary": "...", "recommended_actions": [...]}` which slots into a fixed Markdown template. If the LLM call fails, a template narrative is generated from state counts — `final_report` is always populated.
+
+**Q&A** (separate endpoint): After a job completes, `POST /jobs/{id}/qa` runs hybrid retrieval scoped to that job's documents and returns a grounded answer with page-level citations. Retrieval uses the same bge-m3 + RRF pipeline as the Clause Extractor.
+
+---
+
 ## Tech Stack
 
 | Component | Library |
