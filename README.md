@@ -45,10 +45,10 @@ PDF / DOCX / TXT
 
 ## Agents
 
-### 1. Health Check
+### 1. [Health Check](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/infrastructure/health_check.py)
 Pings Qdrant and Neo4j before any work begins and writes two boolean flags (`qdrant_ready`, `neo4j_ready`) into shared graph state. The LangGraph orchestrator reads these flags immediately and routes conditionally — if Qdrant is down the pipeline skips directly to the Report agent and documents what failed, rather than crashing. Partial results are more useful than a stack trace.
 
-### 2. Clause Extractor
+### 2. [Clause Extractor](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/agents/clause_extractor/agent.py)
 The most computationally intensive agent. For each document × each of the 41 CUAD clause categories, it:
 1. Embeds the category query with `bge-m3` to produce a dense (1024-dim) + learned sparse vector pair.
 2. Runs hybrid retrieval against Qdrant — dense cosine similarity + sparse SPLADE weights, fused with Reciprocal Rank Fusion (RRF k=60) — to find the most relevant chunks.
@@ -58,7 +58,7 @@ All 41 categories are extracted **concurrently per document** (`asyncio.gather`)
 
 Output: `list[ExtractedClause]` — one object per (document, category) pair.
 
-### 3. Risk Scorer
+### 3. [Risk Scorer](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/agents/risk_scorer/agent.py)
 Two-pass scoring — deterministic rules first, LLM reasoning second:
 
 - **Rules pass** (O(1), no LLM): flags missing high-stakes clauses (no Limitation of Liability → high risk), detects specific dangerous normalized values (uncapped liability, perpetual terms), and checks clause presence patterns.
@@ -66,7 +66,7 @@ Two-pass scoring — deterministic rules first, LLM reasoning second:
 
 Output: `list[RiskFlag]` with `risk_level` (high / medium / low), a human-readable `reason`, and a `source_clause_id` that traces back to the originating chunk for citations.
 
-### 4. Entity Mapper
+### 4. [Entity Mapper](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/agents/entity_mapper/agent.py)
 Reads all extracted clauses and writes a structured knowledge graph into Neo4j using `MERGE` (fully idempotent — safe to re-run). The graph schema:
 
 ```
@@ -80,7 +80,7 @@ Party names, jurisdictions, durations, and monetary amounts are extracted from `
 
 Output: `graph_built: bool` in state. The actual data lives in Neo4j.
 
-### 5. Contradiction Detector
+### 5. [Contradiction Detector](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/agents/contradiction_detector/agent.py)
 Queries the Neo4j graph directly with two Cypher queries — it never re-reads extracted clauses from state:
 
 1. **Value conflicts**: `MATCH` clauses of the same type across different documents where `normalized_value` differs (e.g. Governing Law: *Delaware* vs *New York*).
@@ -90,7 +90,7 @@ Each detected conflict is passed to the LLM for a plain-English explanation writ
 
 Output: `list[Contradiction]` with document pair, conflicting values, and explanation.
 
-### 6. Report + Q&A
+### 6. [Report + Q&A](https://github.com/pulkitku2004-ai/LexGraph-DD/blob/main/legal_due_diligence/agents/report_qa/agent.py)
 Terminal agent — reads the full state and produces two things:
 
 **Report**: A deterministic Python formatter builds the risk table and contradiction table first (no LLM, no failure mode). One LLM call then generates `{"executive_summary": "...", "recommended_actions": [...]}` which slots into a fixed Markdown template. If the LLM call fails, a template narrative is generated from state counts — `final_report` is always populated.
