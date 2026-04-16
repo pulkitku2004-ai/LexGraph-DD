@@ -236,7 +236,12 @@ async def _extract_category_async(
         return _missing_clause(clause_type, doc_id, "")
 
     source_chunk_id = chunks[0].chunk_id
-    prompt = build_extraction_prompt(clause_type, [c.text for c in chunks], doc_id)
+    # Use parent_text when available (parent-child chunking, Sprint 15+).
+    # parent_text is the 512-token window the child was split from — the LLM
+    # sees the full surrounding clause context instead of the 128-token child.
+    # Falls back to text (child chunk) for collections indexed before Sprint 15.
+    llm_contexts = [c.parent_text if c.parent_text is not None else c.text for c in chunks]
+    prompt = build_extraction_prompt(clause_type, llm_contexts, doc_id)
 
     # ── LLM call (async, rate-limited by semaphore) ────────────────────────
     async with sem:

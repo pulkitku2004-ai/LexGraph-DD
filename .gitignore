@@ -34,9 +34,14 @@ env/
 *.pt
 *.bin
 *.safetensors
+*.pkl
 eval/sample_ids.json
 eval/results/
+eval/cache/
 samples/
+
+# Internal / legacy docs
+CONTEXT_old.md
 
 # Claude Code local settings
 .claude/

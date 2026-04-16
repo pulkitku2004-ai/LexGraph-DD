@@ -118,10 +118,20 @@ class RetrievedChunk:
     chunk_id: str
     doc_id: str
     page_number: int
-    text: str
+    text: str               # child chunk text (256 tokens) — what was embedded
     rrf_score: float
-    sparse_rank: int | None   # None if not in sparse top-k
-    dense_rank: int | None    # None if not in dense top-k
+    sparse_rank: int | None     # None if not in sparse top-k
+    dense_rank: int | None      # None if not in dense top-k
+    parent_text: str | None = None
+    # parent_text: the 2048-token contiguous parent window this child belongs to.
+    # The LLM receives parent_text (not text) for full clause context.
+    parent_id: str | None = None
+    # parent_id: UUID shared by all children of the same parent window.
+    # Retriever deduplicates by parent_id so the LLM receives each parent once.
+    parent_chunk_index: int | None = None
+    # parent_chunk_index: document-order position of the parent (0, 1, 2…).
+    # After score-order dedup, selected parents are re-sorted by this field
+    # so the LLM sees them in document order (Article 2 before Article 10).
 
 
 def _hyde_expand(clause_type: str, fallback_query: str) -> str:
@@ -188,14 +198,13 @@ def _dense_ranks(
     query_vector: list[float],
     doc_id: str,
     top_k: int,
-) -> dict[str, tuple[int, str, int, str]]:
+) -> dict[str, tuple[int, str, int, str, str | None, str | None, int | None]]:
     """
     Get dense retrieval ranks for chunks in doc_id from Qdrant.
 
-    Returns dict: {chunk_id: (rank, text, page_number, doc_id)}
+    Returns dict: {chunk_id: (rank, text, page_number, doc_id, parent_text, parent_id, parent_chunk_index)}
     Rank is 0-indexed (rank 0 = best).
-
-    Uses 'dense' named vector — the bge-m3 1024-dim cosine field.
+    parent_* fields are None for collections indexed before Sprint 16.
     """
     client = get_qdrant_client()
 
@@ -223,6 +232,9 @@ def _dense_ranks(
             payload.get("text", ""),
             payload.get("page_number", 0),
             payload.get("doc_id", doc_id),
+            payload.get("parent_text"),
+            payload.get("parent_id"),
+            payload.get("parent_chunk_index"),
         )
     return result
 
@@ -231,12 +243,13 @@ def _sparse_ranks(
     sparse_vector: dict[int, float],
     doc_id: str,
     top_k: int,
-) -> dict[str, tuple[int, str, int, str]]:
+) -> dict[str, tuple[int, str, int, str, str | None, str | None, int | None]]:
     """
     Get sparse retrieval ranks for chunks in doc_id from Qdrant.
 
-    Returns dict: {chunk_id: (rank, text, page_number, doc_id)}
+    Returns dict: {chunk_id: (rank, text, page_number, doc_id, parent_text, parent_id, parent_chunk_index)}
     Rank is 0-indexed (rank 0 = best).
+    parent_* fields are None for collections indexed before Sprint 16.
 
     Uses settings.sparse_vector_name ('sparse') — the bge-m3 SPLADE-style field.
     Qdrant computes dot product over shared token IDs between the query sparse
@@ -250,7 +263,6 @@ def _sparse_ranks(
     client = get_qdrant_client()
 
     if not sparse_vector:
-        # Empty sparse vector would return no results — fall back gracefully
         logger.warning("[retriever] empty sparse query vector for doc_id=%s", doc_id)
         return {}
 
@@ -281,6 +293,9 @@ def _sparse_ranks(
             payload.get("text", ""),
             payload.get("page_number", 0),
             payload.get("doc_id", doc_id),
+            payload.get("parent_text"),
+            payload.get("parent_id"),
+            payload.get("parent_chunk_index"),
         )
     return result
 
@@ -358,11 +373,10 @@ def retrieve(
         if sparse_rank is not None:
             rrf_score += 1.0 / (RRF_K + sparse_rank)
 
-        # Get text + metadata from dense results (primary payload source)
         if chunk_id in dense_results:
-            _, text, page_number, d_id = dense_results[chunk_id]
+            _, text, page_number, d_id, parent_text, parent_id, parent_chunk_index = dense_results[chunk_id]
         else:
-            _, text, page_number, d_id = sparse_results[chunk_id]
+            _, text, page_number, d_id, parent_text, parent_id, parent_chunk_index = sparse_results[chunk_id]
 
         fused.append(RetrievedChunk(
             chunk_id=chunk_id,
@@ -372,6 +386,9 @@ def retrieve(
             rrf_score=rrf_score,
             sparse_rank=sparse_rank,
             dense_rank=dense_rank,
+            parent_text=parent_text,
+            parent_id=parent_id,
+            parent_chunk_index=parent_chunk_index,
         ))
 
     fused.sort(key=lambda x: x.rrf_score, reverse=True)
@@ -385,12 +402,36 @@ def retrieve(
         fused = [fused[i] for i in ranked_indices]
         logger.debug("[retriever] reranked %d candidates", len(fused))
 
-    logger.debug(
-        "[retriever] doc=%s query='%s...' → %d candidates, returning top %d",
-        doc_id, query_text[:40], len(fused), top_k,
+    # ── Stage 1: score-order deduplication by parent_id ───────────────────
+    # Walk children best-score-first. When a new parent_id is seen, accept it.
+    # Multiple children from the same parent → the highest-scoring child wins;
+    # its parent_text is what the LLM receives. Stop when top_k unique parents
+    # are collected. Falls back to chunk_id dedup for pre-Sprint-16 collections.
+    seen: set[str] = set()
+    deduped: list[RetrievedChunk] = []
+    for chunk in fused:
+        key = chunk.parent_id if chunk.parent_id is not None else chunk.chunk_id
+        if key not in seen:
+            seen.add(key)
+            deduped.append(chunk)
+        if len(deduped) == top_k:
+            break
+
+    # ── Stage 2: re-sort selected parents into document order ─────────────
+    # Legal clauses reference prior sections. Sending Article 10 before Article 2
+    # breaks the LLM's understanding of legal hierarchy and cross-references.
+    # parent_chunk_index is the ordinal position of the parent in the document.
+    # Children without parent_chunk_index (pre-Sprint-16) keep score order.
+    deduped.sort(
+        key=lambda c: c.parent_chunk_index if c.parent_chunk_index is not None else float("inf")
     )
 
-    return fused[:top_k]
+    logger.debug(
+        "[retriever] doc=%s query='%s...' → %d candidates, %d unique parents (doc order)",
+        doc_id, query_text[:40], len(fused), len(deduped),
+    )
+
+    return deduped
 
 
 def retrieve_multi(
@@ -447,13 +488,32 @@ def retrieve_multi(
             rrf_score=score_sums[cid],
             sparse_rank=metadata[cid].sparse_rank,
             dense_rank=metadata[cid].dense_rank,
+            parent_text=metadata[cid].parent_text,
+            parent_id=metadata[cid].parent_id,
+            parent_chunk_index=metadata[cid].parent_chunk_index,
         )
         for cid in score_sums
     ]
     merged.sort(key=lambda x: x.rrf_score, reverse=True)
 
-    logger.debug(
-        "[retriever] multi-query doc=%s queries=%d → %d unique candidates, returning top %d",
-        doc_id, len(queries), len(merged), top_k,
+    # Stage 1: score-order dedup by parent_id (same logic as retrieve())
+    seen: set[str] = set()
+    deduped: list[RetrievedChunk] = []
+    for chunk in merged:
+        key = chunk.parent_id if chunk.parent_id is not None else chunk.chunk_id
+        if key not in seen:
+            seen.add(key)
+            deduped.append(chunk)
+        if len(deduped) == top_k:
+            break
+
+    # Stage 2: re-sort into document order
+    deduped.sort(
+        key=lambda c: c.parent_chunk_index if c.parent_chunk_index is not None else float("inf")
     )
-    return merged[:top_k]
+
+    logger.debug(
+        "[retriever] multi-query doc=%s queries=%d → %d unique candidates, %d unique parents (doc order)",
+        doc_id, len(queries), len(merged), len(deduped),
+    )
+    return deduped

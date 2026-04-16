@@ -61,12 +61,12 @@ CUAD_CATEGORIES: dict[str, str] = {
     "Dispute Resolution":          "dispute resolution arbitration litigation venue court",
 
     # ── Restrictive Covenants ──────────────────────────────────────────────
-    "Non-Compete":                 "non-compete non-competition shall not market distribute sell competing product in territory",
+    "Non-Compete":                 "non-compete non-competition restrictive covenant shall not compete competing business competing products competing services engage in competition",
     "Exclusivity":                 "exclusivity exclusive rights sole provider co-exclusive basis exclusive right to promote distribute sell",
-    "No-Solicit of Customers":     "no solicit customers non-solicitation clients shall not solicit customers of other party",
+    "No-Solicit of Customers":     "shall not solicit divert business customers clients accounts of the other party directly or indirectly",
     "No-Solicit of Employees":     "no solicit employees hire recruit personnel",
     "Non-Disparagement":           "non-disparagement shall not make disparaging statements derogatory defamatory comments refrain from speaking negatively about",
-    "Covenant Not To Sue":         "covenant not to sue shall not contest challenge attack dispute validity ownership registration trademark",
+    "Covenant Not To Sue":         "covenant not to sue release claims waive right to bring action not assert legal claims discharge not contest challenge attack impair title trademark validity ownership",
 
     # ── Liability & Indemnification ────────────────────────────────────────
     "Limitation of Liability":     "limitation of liability indirect consequential damages excluded",
@@ -77,28 +77,31 @@ CUAD_CATEGORIES: dict[str, str] = {
 
     # ── Intellectual Property ──────────────────────────────────────────────
     "IP Ownership Assignment":     "intellectual property ownership assignment work made for hire all right title interest vests assigns work product inventions",
-    "Joint IP Ownership":          "joint ownership jointly owned intellectual property jointly developed co-developed each party owns shared ownership",
+    "Joint IP Ownership":          "joint IP ownership jointly owned co-owned each party owns co-invented jointly developed jointly created intellectual property shared ownership both parties",
     "License Grant":               "license grant licensed rights use software platform",
     "Non-Transferable License":    "non-transferable license cannot assign sublicense transfer",
     "Irrevocable or Perpetual License": "irrevocable perpetual license permanent rights",
+    "Unlimited/All-You-Can-Eat License": "unlimited non-exclusive perpetual irrevocable royalty free worldwide license unrestricted use",
     "Source Code Escrow":          "source code escrow deposit release conditions",
     "IP Restriction":              "intellectual property restrictions permitted use limitations",
 
     # ── Warranties ─────────────────────────────────────────────────────────
-    "Warranty Duration":           "warranty period duration months years guarantee",
+    "Warranty Duration":           "warranty period duration months years guarantee defect rejection return expiration",
     "Product Warranty":            "product warranty performance fitness merchantability",
 
     # ── Financial ─────────────────────────────────────────────────────────
     "Payment Terms":               "payment terms invoice due date net days fees",
-    "Revenue/Profit Sharing":      "revenue sharing profit sharing royalty equal to per unit percentage of net sales gross margin",
-    "Price Restrictions":          "price restrictions most favored nation pricing cap",
+    "Revenue/Profit Sharing":      "revenue sharing profit sharing royalty percentage net receipts gross revenue net sales proceeds equal to per unit",
+    "Price Restrictions":          "price restrictions pricing cap floor ceiling most favored nation",
+    "Most Favored Nation":         "most favored nation MFN no less favorable price terms any third party",
+    "Competitive Restriction Exception": "notwithstanding competitive restriction exception carve-out permitted competing business activities despite exclusivity non-compete",
     "Minimum Commitment":          "minimum commitment shall maintain at least minimum number sales representatives staff guaranteed amount purchase volume",
     "Volume Restriction":          "volume restriction maximum usage limit quota not to exceed maximum number up to limit per month year capacity ceiling threshold",
 
     # ── Operational ────────────────────────────────────────────────────────
     "Audit Rights":                "audit rights inspect records books financial",
     "Post-Termination Services":   "post-termination services step-in right authorized to maintain service continue perform obligations following termination wind-down transition",
-    "Change of Control":           "change of control acquisition merger assign agreement affiliate successor terminate upon change of controlling interest",
+    "Change of Control":           "change of control merger acquisition beneficial ownership voting securities controlling interest majority shares takeover consent assignment terminate",
     "Anti-Assignment":             "anti-assignment cannot assign transfer consent required",
     "Third Party Beneficiary":     "third party beneficiary rights benefits",
 
@@ -132,9 +135,9 @@ CUAD_ALT_QUERIES: dict[str, list[str]] = {
         "not contest challenge dispute ownership validity registration intellectual property trademark",
     ],
     "IP Ownership Assignment": [
-        # "vest in and inure to the benefit of", "hereby does assign"
-        "shall assign hereby does assign all right title and interest in and to domain name registration",
-        "vest in inure to benefit of goodwill assign transfer intellectual property created developed",
+        # "shall become our property", "concept process improvement shall be property of"
+        "shall become property of company may utilize disclose concept process improvement developed during",
+        "acknowledges agrees work product invention improvement shall be owned by licensor franchisor all right title",
     ],
     "Minimum Commitment": [
         # "shall maintain at least N sales representatives", "shall ensure sufficient staff"
@@ -176,6 +179,31 @@ CUAD_ALT_QUERIES: dict[str, list[str]] = {
         "jointly created developed each party shall own co-inventors shared patent rights",
         "joint development agreement both parties own intellectual property jointly created work",
     ],
+    "Most Favored Nation": [
+        # CUAD: "prices shall be no less favorable than those at which seller sells to any other party"
+        "prices shall be no less favorable than prices offered to any other customer distributor party",
+        "if licenses to any third party on more favorable terms licensee entitled to same terms conditions",
+    ],
+    "Competitive Restriction Exception": [
+        # "Notwithstanding the foregoing, may make available from parties other than [exclusive party]"
+        "notwithstanding the foregoing may engage purchase from parties other than exclusive sponsor exception to restriction",
+        "has no control influence over decisions third party arrangement carve out exception permitted notwithstanding",
+    ],
+    "Warranty Duration": [
+        # "within two months prior or six months past expiration", "within seven days after receipt defective"
+        "eligible return reimbursement months prior past expiration date defective product outdated reject",
+        "inspect products receipt reject defective within days after receipt warranty claim return period",
+    ],
+    "No-Solicit of Customers": [
+        # "except as otherwise expressly provided, agent shall not solicit"
+        "shall not directly or indirectly solicit divert customers clients accounts business of the other party",
+        "except as otherwise provided agent shall not solicit compete with customers clients of the other party",
+    ],
+    "Unlimited/All-You-Can-Eat License": [
+        # "unlimited, non-exclusive, perpetual, irrevocable, royalty free, worldwide right and license"
+        "unlimited non-exclusive perpetual irrevocable royalty free worldwide right license unrestricted use content",
+        "all-you-can-eat unlimited seats users copies unrestricted enterprise wide license without limitation",
+    ],
 }
 
 
@@ -185,7 +213,10 @@ SYSTEM_PROMPT = """You are a legal contract analysis assistant. Your job is to e
 
 Rules:
 - Return ONLY valid JSON. No explanation, no markdown, no code blocks.
-- If the clause is not present in the provided text, set "found" to false.
+- Look for the SUBSTANCE of the clause, not just an explicitly labeled section. Contracts rarely title their clauses with the exact category name — look for the underlying right, obligation, or fact.
+- Set "found" to true if the text contains ANY relevant information about the clause, even if it uses different terminology or does not explicitly label the clause by name.
+- Only set "found" to false if the text contains absolutely no information relevant to this clause type.
+- "clause_text" must be the verbatim sentence(s) from the contract that best express this clause.
 - "normalized_value" must be a short extracted fact (e.g. "Delaware", "30 days", "$500,000"), not a full sentence.
 - "confidence" must be between 0.0 and 1.0.
 - If found is false, set clause_text and normalized_value to null."""
@@ -224,7 +255,10 @@ def build_extraction_prompt(
         clause_type, "the key extracted value (short, specific fact)"
     )
 
-    return f"""Extract the "{clause_type}" clause from the following contract text.
+    hint = _extraction_hints.get(clause_type, "")
+    hint_line = f"\nHint: {hint}" if hint else ""
+
+    return f"""Extract the "{clause_type}" clause from the following contract text.{hint_line}
 
 Document: {doc_id}
 
@@ -238,6 +272,44 @@ Return JSON with exactly these fields:
   "normalized_value": "{normalized_examples}, or null if not found",
   "confidence": 0.0 to 1.0
 }}"""
+
+
+# Per-category extraction hints injected into the user prompt.
+# Used for categories where the LLM systematically returns found=False
+# even when the right chunk is retrieved — because the clause substance
+# appears under different wording than the category name implies.
+_extraction_hints: dict[str, str] = {
+    "Agreement Date":
+        "This is often just a date in the preamble, e.g. 'This Agreement is dated as of November 20, 2007' or 'made and entered into as of [date]'. It does not need to be a labeled clause section.",
+    "Document Name":
+        "This is the title of the agreement, typically at the top of the document, e.g. 'JOINT FILING AGREEMENT' or 'SOFTWARE LICENSE AGREEMENT'. Extract the title as found.",
+    "Termination for Convenience":
+        "Look for any right to terminate without cause, without giving a specific reason, or upon notice alone. Phrases like 'terminate at any time', 'terminate without cause', or 'terminate upon [N] days notice' all qualify — even if not labeled 'for convenience'.",
+    "Post-Termination Services":
+        "Look for any obligation or right that continues or takes effect AFTER the agreement ends — e.g. transition assistance, completing in-flight work, returning data, wind-down periods, or survival of specific obligations.",
+    "Non-Transferable License":
+        "Look for any restriction on sublicensing, assigning, or transferring the license. Phrases like 'may not sublicense', 'no right to grant sublicenses', or 'non-transferable' all qualify.",
+    "Minimum Commitment":
+        "Look for any guaranteed minimum — a minimum purchase, minimum royalty, minimum volume, or minimum revenue obligation. Phrases like 'guaranteed minimum', 'shall purchase at least', or 'minimum royalty' all qualify.",
+    "Rofr/Rofo/Rofn":
+        "Look for any right of first refusal, right of first offer, or right of first negotiation. Phrases like 'right to match', 'first right to purchase', or 'right of first offer' all qualify.",
+    "Non-Disparagement":
+        "Look for any obligation to refrain from making negative, derogatory, or disparaging statements about the other party. Does not need the word 'disparagement'.",
+    "Covenant Not To Sue":
+        "Look for any release of claims, waiver of right to sue, or covenant not to assert legal claims. Phrases like 'shall not challenge', 'release all claims', 'waives any right to bring action', or 'shall not contest' all qualify.",
+    "Revenue/Profit Sharing":
+        "Look for any payment based on a percentage of revenue, profit, sales, or gross margin — royalties, revenue shares, or profit participation all qualify.",
+    "Volume Restriction":
+        "Look for any cap or ceiling on usage, quantity, number of users, seats, copies, or transactions — e.g. 'not to exceed', 'up to N units', 'maximum of'.",
+    "Change of Control":
+        "Look for any clause triggered by a merger, acquisition, change of ownership, or transfer of control — e.g. termination rights, assignment rights, or consent requirements upon such events.",
+    "IP Ownership Assignment":
+        "Look for any transfer of ownership of intellectual property, work product, or inventions to the other party. Phrases like 'shall become our property', 'assigns all right title and interest', or 'work made for hire' all qualify.",
+    "Joint IP Ownership":
+        "Look for any clause where both parties share or jointly own intellectual property, inventions, or developments created together.",
+    "Source Code Escrow":
+        "Look for mentions of source code deposit, escrow agent, escrow agreement, or software repository held by a third party.",
+}
 
 
 # Clause-specific guidance for normalized_value extraction.

@@ -1,7 +1,9 @@
 import json
+import sys
 from collections import defaultdict
 
-with open("eval/results/bge_m3_topk3_enriched.json") as f:
+path = sys.argv[1] if len(sys.argv) > 1 else "eval/results/bge_m3_topk3_enriched_mq.json"
+with open(path) as f:
     results = json.load(f)
 
 category_stats = defaultdict(lambda: {"hits": 0, "total": 0})

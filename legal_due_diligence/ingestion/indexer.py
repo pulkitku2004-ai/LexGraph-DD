@@ -117,6 +117,13 @@ def index_chunks(embedded_chunks: list[EmbeddedChunk]) -> None:
                 "chunk_index": ec.chunk.chunk_index,
                 "text": ec.chunk.text,
                 "token_count": ec.chunk.token_count,
+                # parent_text: the 512-token window this child was split from.
+                # The retriever reads this and passes it to the LLM instead of
+                # the 128-token child text, giving the LLM the full clause context.
+                # None when chunks were not created with parent-child splitting.
+                "parent_text": ec.chunk.parent_text,
+                "parent_id": ec.chunk.parent_id,
+                "parent_chunk_index": ec.chunk.parent_chunk_index,
             },
         )
         for ec in embedded_chunks

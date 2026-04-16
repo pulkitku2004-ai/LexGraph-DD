@@ -53,11 +53,13 @@ Each conflict surfaces in the report with an LLM-generated plain-English explana
 PDF / DOCX / TXT
        │
        ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Ingestion                                                        │
-│  PyMuPDF / python-docx → token chunker (512 tok, 128 overlap)   │
-│  → bge-m3 embed (dense 1024-dim + learned sparse) → Qdrant      │
-└──────┬───────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Ingestion                                                            │
+│  PyMuPDF / python-docx → heading merge → parent-child chunker        │
+│  (2048-tok parents / 256-tok children, 51-tok child overlap)         │
+│  → bge-m3 embed children (dense 1024-dim CLS + learned sparse)       │
+│  → Qdrant (child vectors + parent text in payload)                   │
+└──────┬───────────────────────────────────────────────────────────────┘
        │
        │  LangGraph state machine (6 agents, conditional routing)
        │
@@ -68,7 +70,7 @@ PDF / DOCX / TXT
          ▼
 ┌─────────────────┐
 │ Clause          │  41 CUAD categories × hybrid retrieval (bge-m3 sparse+dense+RRF)
-│ Extractor       │  → async LLM extraction (asyncio.gather) → ExtractedClause[]
+│ Extractor       │  → parent-child dedup → async LLM extraction → ExtractedClause[]
 └────────┬────────┘
          ▼
 ┌─────────────────┐
@@ -102,10 +104,11 @@ Pings Qdrant and Neo4j before any work begins and writes two boolean flags (`qdr
 The most computationally intensive agent. For each document × each of the 41 CUAD clause categories, it:
 
 1. Embeds the category query with `bge-m3` → dense (1024-dim) + learned sparse vector pair
-2. Runs hybrid retrieval against Qdrant — dense cosine similarity + sparse SPLADE weights, fused with Reciprocal Rank Fusion (RRF k=60)
-3. Calls an LLM with a structured prompt, returning `{"found": bool, "clause_text": "...", "normalized_value": "...", "confidence": 0.0–1.0}`
+2. Runs hybrid retrieval against Qdrant — dense cosine + sparse SPLADE weights, fused with Reciprocal Rank Fusion (RRF k=60), top-20 candidates each
+3. **Two-stage parent dedup:** stage 1 (score order) deduplicates by `parent_id` to select the best child per parent; stage 2 (doc order) re-sorts surviving parents by `parent_chunk_index` so the LLM sees Article 2 before Article 10
+4. Calls an LLM with the full parent text (up to 2048 tokens per parent), returning `{"found": bool, "clause_text": "...", "normalized_value": "...", "confidence": 0.0–1.0}`
 
-All 41 categories run **concurrently per document** via `asyncio.gather`. All documents run concurrently too. A global `asyncio.Semaphore(10)` caps LLM concurrency to stay within rate limits. 10 hard categories (e.g. *Covenant Not To Sue*, *IP Ownership Assignment*) fire 2 alternative queries each with RRF score summing — solving the vocabulary gap between CUAD category names and real contract language.
+All 41 categories run **concurrently per document** via `asyncio.gather`. All documents run concurrently too. A global `asyncio.Semaphore(10)` caps LLM concurrency to stay within rate limits. 15 hard categories (e.g. *Covenant Not To Sue*, *Revenue/Profit Sharing*, *Non-Compete*) fire 2–3 alternative queries each — RRF scores are summed across queries before dedup — solving the vocabulary gap between CUAD category names and real contract language.
 
 Output: `list[ExtractedClause]` — one object per (document × category) pair.
 
@@ -137,7 +140,7 @@ Queries the Neo4j graph directly via two Cypher queries — never re-reads claus
 1. **Value conflicts** — `MATCH` clauses of the same type across different documents where `normalized_value` differs (e.g. Governing Law: *Delaware* vs *New York*)
 2. **Absence conflicts** — clause present in document A, missing in document B (asymmetric obligations)
 
-Each conflict is passed to the LLM for a plain-English explanation written for a lawyer. If Neo4j is unavailable (`graph_built=False`), returns an empty list immediately and the report notes the skip.
+All Cypher queries are scoped to the current job's `$doc_ids` — the graph accumulates across jobs but contradiction detection never leaks cross-job results. Each conflict is passed to the LLM for a plain-English explanation. If Neo4j is unavailable (`graph_built=False`), returns an empty list immediately and the report notes the skip.
 
 Output: `list[Contradiction]` with document pair, conflicting values, and explanation.
 
@@ -157,7 +160,7 @@ Terminal agent — reads full state, produces two outputs:
 | Orchestration | LangGraph | State machine with conditional routing between agents |
 | Vector store | Qdrant (Docker) | Stores dense + sparse vectors, hybrid search |
 | Knowledge graph | Neo4j 5 (Docker) | Entity graph for cross-document contradiction detection |
-| Embeddings | `BAAI/bge-m3` | Single model: dense (1024-dim CLS) + learned sparse (SPLADE-style) |
+| Embeddings | `BAAI/bge-m3` | Single model: dense (1024-dim CLS, L2-norm) + learned sparse (SPLADE-style) |
 | LLM routing | LiteLLM | Provider abstraction + automatic fallback chain |
 | LLM — extraction | `groq/llama-3.1-8b-instant` → `groq/llama-4-scout-17b` → `ollama/mistral-nemo` | Speed-first, with local fallback |
 | LLM — reasoning | `ollama/mistral-nemo` / OpenRouter free tier | Quality-first for risk scoring and report narrative |
@@ -165,7 +168,7 @@ Terminal agent — reads full state, produces two outputs:
 | DOCX parsing | python-docx | Direct XML access, no external tools |
 | API | FastAPI | Async REST, 202 Accepted pattern for long jobs |
 | UI | Streamlit | Upload interface, job polling, report viewer |
-| Eval | Custom CUAD harness | Recall@K across 1,244 test rows, 41 categories |
+| Eval | Custom CUAD harness + embedding cache | Recall@K across 41 categories; cached chunk embeddings for fast iteration |
 
 ---
 
@@ -173,13 +176,40 @@ Terminal agent — reads full state, produces two outputs:
 
 Evaluated on [`chenghao/cuad_qa`](https://huggingface.co/datasets/chenghao/cuad_qa) — 1,244 test rows across 41 legal clause categories.
 
-| Retrieval Setup | Recall@1 | Recall@3 |
-|---|---|---|
-| bge-base dense-only (baseline) | ~10% | ~16% |
-| bge-m3 hybrid sparse+dense+RRF | **33.3%** | **52.1%** |
-| + Multi-query for hard categories | TBD | TBD |
+| Retrieval Setup | Recall@1 | Recall@3 | Notes |
+|---|---|---|---|
+| legal-bert baseline | — | ~9% | Dense only |
+| bge-base dense-only | ~10% | ~15% | With query prefix |
+| bge-m3 hybrid sparse+dense+RRF | **33.3%** | **52.1%** | 1,244 rows — established benchmark |
+| + parent-child chunking (256/2048) | — | — | Combined below |
+| + multi-query for hard categories | — | — | Combined below |
+| + CUAD definition query enrichment | **26.1%** | **61.4%** | 360-row sample, all improvements combined |
 
-Hybrid retrieval (bge-m3 learned sparse + dense, fused with RRF k=60) gives a **3× improvement** over the dense-only baseline. HyDE (Hypothetical Document Embeddings) was evaluated and **found to hurt** — R@3 dropped to 40.8% — so it is disabled by default.
+**3× improvement** over the dense-only baseline at Recall@3. Parent-child chunking (Sprint 16) delivers longer context to the LLM while keeping embeddings focused on dense child passages. Multi-query retrieval (+6pp) fires 2–3 alternative phrasings for 15 hard categories and sums RRF scores before deduplication.
+
+**Approaches evaluated and rejected:**
+
+| Approach | R@3 delta | Reason |
+|---|---|---|
+| HyDE (Hypothetical Document Embeddings) | −3.9pp | LLM generates boilerplate; shifts embeddings away from contract language |
+| Cross-encoder reranker (bge-reranker-v2-m3) | −9.5pp | MS-MARCO trained; domain mismatch on legal text |
+
+**Per-category breakdown (360-row run, worst categories):**
+
+| Category | Recall@3 | n |
+|---|---|---|
+| Most Favored Nation | 0% | 3 |
+| Non-Compete | 10% | 10 |
+| Revenue/Profit Sharing | 20% | 10 |
+| Joint IP Ownership | 29% | 7 |
+| Covenant Not To Sue | 40% | 10 |
+| Change of Control | 40% | 10 |
+| IP Ownership Assignment | 40% | 10 |
+| Non-Disparagement | 43% | 7 |
+| Parties | 100% | 10 |
+| Document Name | 90% | 10 |
+
+Hard categories (0–29%) are retrieval-ceiling problems — the clause is present but uses vocabulary far removed from its category name, and no query enrichment recovers it without fine-tuning.
 
 ---
 
@@ -195,9 +225,9 @@ This is a working research prototype. Before deploying in a production legal env
 | **Rate-limit dependency** | The extraction pipeline makes ~2,050 LLM calls per 50-document job. Groq's free tier (6,000 TPM) can throttle large batches without the local Ollama fallback running. |
 | **English-only** | bge-m3 is multilingual but the CUAD prompts and risk rules are English-only. Non-English contracts will retrieve correctly but extract poorly. |
 | **No document deduplication** | Uploading the same contract twice creates duplicate vectors and graph nodes. Qdrant `MERGE` handles the graph safely, but vector duplicates inflate retrieval noise. |
-| **Eval gap on hard categories** | 10 categories (Covenant Not To Sue, IP Ownership Assignment, etc.) still have low R@3 despite multi-query retrieval. Multi-query eval result is TBD. |
+| **Retrieval ceiling on hard categories** | Most Favored Nation (0%), Non-Compete (10%), Revenue/Profit Sharing (20%) remain low after query enrichment and multi-query. Root cause: clause vocabulary diverges significantly from category name. Requires fine-tuned embeddings or extraction model. |
 | **No PDF table/form extraction** | PyMuPDF extracts text flow only. Contracts with obligation tables or signature blocks in PDF form fields may lose structured data. |
-| **No fine-tuned extraction model** | Extraction uses a general-purpose LLM. A fine-tuned model on CUAD (e.g. legal-bert or a LoRA-tuned Llama) would improve accuracy significantly, especially on low-recall categories. |
+| **No fine-tuned extraction model** | Extraction uses a general-purpose LLM. A fine-tuned model on CUAD would improve accuracy significantly on low-recall categories. |
 
 ---
 
@@ -282,19 +312,23 @@ curl -X POST http://localhost:8000/jobs/{job_id}/qa \
 LexGraph-DD/
 ├── legal_due_diligence/
 │   ├── agents/
-│   │   ├── clause_extractor/        # bge-m3 hybrid retrieval + async LLM extraction
+│   │   ├── clause_extractor/        # bge-m3 hybrid retrieval + parent-child dedup + async LLM extraction
 │   │   ├── risk_scorer/             # Deterministic rules + LLM reasoning
 │   │   ├── entity_mapper/           # Neo4j knowledge graph writer
 │   │   ├── contradiction_detector/  # Cypher queries + LLM explanations
 │   │   ├── report_qa/               # Markdown formatter + RAG Q&A
 │   │   └── orchestrator/            # LangGraph state machine + conditional routing
-│   ├── ingestion/                   # PDF/DOCX/TXT loader, chunker, bge-m3 embedder, indexer
+│   ├── ingestion/                   # PDF/DOCX/TXT loader, parent-child chunker, bge-m3 embedder, indexer
 │   ├── core/                        # Settings (pydantic-settings), domain models, GraphState
 │   ├── api/                         # FastAPI endpoints + background job runner
 │   ├── ui/                          # Streamlit interface
 │   └── infrastructure/              # Qdrant + Neo4j client singletons, health check
 ├── eval/
-│   └── cuad_eval.py                 # Retrieval eval harness — Recall@K on CUAD benchmark
+│   ├── cuad_eval.py                 # Retrieval eval harness — Recall@K on CUAD benchmark
+│   ├── e2e_eval.py                  # End-to-end extraction eval (Token F1 + found rate)
+│   ├── cache/                       # Chunk embedding cache — keyed by model+chunk params (30× speedup)
+│   └── results/                     # JSON result files per run
+├── analyze_categories.py            # Per-category R@3 breakdown from eval JSON
 ├── docker-compose.yml               # Qdrant + Neo4j services
 ├── .env.example                     # Environment variable template
 └── requirements.txt                 # Direct dependencies
@@ -306,11 +340,11 @@ LexGraph-DD/
 
 | Role | Provider | Rationale |
 |---|---|---|
-| Extraction (~2,050 calls/job) | Groq free tier | ~300ms/call, 6,000 TPM sufficient with semaphore cap |
-| Extraction fallback | `groq/llama-4-scout-17b` | Separate rate-limit bucket from primary model |
+| Extraction (~2,050 calls/job) | Groq free tier (`llama-3.1-8b-instant`) | ~300ms/call, 6,000 TPM sufficient with semaphore cap |
+| Extraction fallback 1 | `groq/llama-4-scout-17b` | Separate rate-limit bucket from primary model |
 | Extraction fallback 2 | `ollama/mistral-nemo` (local) | Zero rate limit, fully offline, runs on M-series via MPS |
 | Reasoning (report, risk) | `ollama/mistral-nemo` | Unlimited local inference for quality-sensitive passes |
-| Reasoning (small jobs) | OpenRouter free tier | Access to 120B–405B models at zero cost, ~200 req/day |
+| Reasoning (small jobs) | OpenRouter free tier | Access to 120B+ models at zero cost, ~200 req/day |
 
 The fallback chain is handled automatically by LiteLLM — no custom retry logic in the application code.
 
@@ -321,15 +355,17 @@ The fallback chain is handled automatically by LiteLLM — no custom retry logic
 ```bash
 source .venv/bin/activate
 
-# Sanity check (50 rows, ~2 min)
-python eval/cuad_eval.py --n 50 --enrich-queries
+# Quick sanity check (50 rows, ~2 min warm / ~7 min cold)
+python eval/cuad_eval.py --n 50 --enrich-queries --multi-query
 
-# Full benchmark (1,244 rows)
-python eval/cuad_eval.py --full --enrich-queries
-
-# With multi-query retrieval for hard categories
+# Standard benchmark run (360 rows, ~2 min warm / ~50 min cold)
 python eval/cuad_eval.py --n 400 --enrich-queries --multi-query
+
+# Per-category breakdown
+python analyze_categories.py eval/results/<result_file>.json
 ```
+
+The eval harness caches all chunk embeddings to `eval/cache/` on the first run. Subsequent runs with the same model and chunk settings skip GPU embedding entirely — a 360-row eval drops from ~50 minutes to ~2 minutes. The cache filename encodes the model and chunk parameters and auto-invalidates on configuration change.
 
 Results saved to `eval/results/` as JSON.
 

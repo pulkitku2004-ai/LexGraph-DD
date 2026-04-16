@@ -134,15 +134,92 @@ class Chunk:
     doc_id: str
     file_path: str
     page_number: int
-    text: str
+    text: str               # child chunk text — embedded into Qdrant for retrieval
     token_count: int
-    chunk_index: int        # position within document (0-indexed)
+    chunk_index: int        # position within document (0-indexed, child-level)
+    parent_text: str | None = field(default=None)
+    parent_id: str | None = field(default=None)
+    # parent_id: UUID shared by all children of the same parent window.
+    # Used by the retriever to deduplicate: multiple children from the same
+    # parent → send parent_text once to the LLM, not N times.
+    parent_chunk_index: int | None = field(default=None)
+    # parent_chunk_index: ordinal position of the parent in the document (0, 1, 2…).
+    # After dedup by parent_id (score order), the retriever re-sorts selected
+    # parents by parent_chunk_index ascending so the LLM receives them in
+    # document order (Article 2 before Article 10, not by retrieval score).
+
+
+def _parent_child_chunks(
+    text: str,
+    parent_size: int,
+    child_size: int,
+    child_overlap: int,
+) -> list[tuple[str, str, str, int]]:
+    """
+    Split text into (child_text, parent_text, parent_id, parent_chunk_index) tuples.
+
+    Parents — contiguous, non-overlapping windows of parent_size tokens:
+      Non-overlapping parents guarantee no text ever appears in two parent
+      windows. If parents overlapped, the retriever could send the same clause
+      twice (once from each parent) — wasting LLM context and confusing output.
+
+    Children — overlapping windows of child_size tokens within each parent:
+      Overlap is LOCAL within the parent (children never cross parent boundaries).
+      This prevents a clause-boundary split where the key term is at the very
+      end of one child and missing from the next.
+
+    parent_id — UUID shared by all children belonging to the same parent.
+      The retriever uses this to deduplicate: if child A and child B both hit
+      and share a parent_id, the LLM receives the parent text only once.
+
+    parent_chunk_index — ordinal position of the parent in the document (0, 1, 2…).
+      After dedup (score-order selection), the retriever re-sorts selected parents
+      by parent_chunk_index ascending so the LLM sees them in document order.
+
+    Why work at the token-ID level rather than calling _token_chunks twice?
+      _token_chunks decodes token IDs back to text, then re-encodes for the child
+      pass. Decode→encode roundtrips can shift token boundaries. Working at the
+      token-ID level throughout ensures parent and child windows are exact slices
+      of the same token sequence — no boundary drift.
+    """
+    tokenizer = _get_tokenizer()
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+
+    if not token_ids:
+        return []
+
+    child_step = max(1, child_size - child_overlap)
+    triples: list[tuple[str, str, str, int]] = []
+
+    for parent_idx, p_start in enumerate(range(0, len(token_ids), parent_size)):
+        p_end = min(p_start + parent_size, len(token_ids))
+        p_tokens = token_ids[p_start:p_end]
+        parent_text: str = tokenizer.decode(p_tokens, skip_special_tokens=True)  # type: ignore[assignment]
+        parent_id = str(uuid.uuid4())
+
+        for c_start in range(0, len(p_tokens), child_step):
+            c_end = min(c_start + child_size, len(p_tokens))
+            child_text: str = tokenizer.decode(p_tokens[c_start:c_end], skip_special_tokens=True)  # type: ignore[assignment]
+            triples.append((child_text, parent_text, parent_id, parent_idx))
+            if c_end == len(p_tokens):
+                break
+
+    return triples
 
 
 def chunk_document(document: LoadedDocument) -> list[Chunk]:
     """
-    Chunk a loaded document into token-bounded overlapping segments.
-    Returns chunks ordered by (page_number, position_within_page).
+    Chunk a loaded document into parent-child token-bounded segments.
+
+    Child chunks (child_chunk_size=256 tokens, 51-token overlap) are embedded
+    into Qdrant for precise retrieval. Each child carries parent_text (2048
+    tokens, contiguous), parent_id (UUID shared across siblings), and
+    parent_chunk_index (document-order position of the parent).
+
+    The retriever uses parent_id to deduplicate and parent_chunk_index to
+    reorder selected parents into document order before the LLM sees them.
+
+    Returns chunks ordered by (page_number, child position within page).
     """
     chunks: list[Chunk] = []
     chunk_index = 0
@@ -151,22 +228,26 @@ def chunk_document(document: LoadedDocument) -> list[Chunk]:
         if not page.text.strip():
             continue
 
-        page_chunks = _token_chunks(
+        tuples = _parent_child_chunks(
             _merge_headings(page.text),
-            chunk_size=settings.chunk_size,
-            overlap=settings.chunk_overlap,
+            parent_size=settings.chunk_size,
+            child_size=settings.child_chunk_size,
+            child_overlap=settings.child_chunk_overlap,
         )
 
-        for chunk_text in page_chunks:
-            token_count = _count_tokens(chunk_text)
+        for child_text, parent_text, parent_id, parent_chunk_index in tuples:
+            token_count = _count_tokens(child_text)
             chunks.append(Chunk(
                 chunk_id=str(uuid.uuid4()),
                 doc_id=document.doc_id,
                 file_path=document.file_path,
                 page_number=page.page_number,
-                text=chunk_text,
+                text=child_text,
                 token_count=token_count,
                 chunk_index=chunk_index,
+                parent_text=parent_text,
+                parent_id=parent_id,
+                parent_chunk_index=parent_chunk_index,
             ))
             chunk_index += 1
 

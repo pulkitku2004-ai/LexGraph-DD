@@ -193,11 +193,44 @@ class Settings(BaseSettings):
     )
 
     # ── Chunking strategy ────────────────────────────────────────────────────
-    # 512 tokens ≈ one dense contract clause. Going larger blurs clause
-    # boundaries and hurts retrieval precision. 128-token overlap prevents
-    # splitting a clause across two chunks.
-    chunk_size: int = Field(default=512)
-    chunk_overlap: int = Field(default=128)
+    # Parent-child chunking (Sprint 16 revision):
+    #
+    # Parents (chunk_size = 2048 tokens, contiguous — NO overlap between parents):
+    #   - Large window gives the LLM a full legal section with surrounding context.
+    #   - Contiguous (non-overlapping) parents mean the same text never appears in
+    #     two parents — no duplicate context sent to the LLM.
+    #   - Each parent gets a UUID parent_id + sequential parent_chunk_index (its
+    #     position in the document). Both stored in every child's Qdrant payload.
+    #
+    # Children (child_chunk_size = 256 tokens, 20% overlap = 51 tokens):
+    #   - Embedded into Qdrant for precise retrieval.
+    #   - Overlap is LOCAL within the parent — children do not cross parent
+    #     boundaries, so no child ever references text from two parents.
+    #
+    # Retriever deduplication (two-stage sort):
+    #   Stage 1 — Score order: sort all child hits by RRF score descending.
+    #             Walk the list; when a new parent_id is seen, add that parent
+    #             to the selected set. Stop when top_k unique parents collected.
+    #             (Best child per parent determines which parents make the cut.)
+    #   Stage 2 — Document order: sort the selected parents by parent_chunk_index
+    #             ascending before passing to the LLM.
+    #             Legal clauses reference prior sections; sending Article 10 before
+    #             Article 2 breaks the LLM's understanding of legal hierarchy.
+    #
+    # chunk_overlap: 0 — parents are contiguous; field kept for backward compat.
+    chunk_size: int = Field(default=2048)
+    chunk_overlap: int = Field(
+        default=0,
+        description="Unused post-Sprint-16 — parents are contiguous (no inter-parent overlap).",
+    )
+    child_chunk_size: int = Field(
+        default=256,
+        description="Token size of child chunks embedded into Qdrant for retrieval.",
+    )
+    child_chunk_overlap: int = Field(
+        default=51,
+        description="Token overlap between consecutive child chunks within a parent (≈20% of 256).",
+    )
 
     # ── Async extraction ─────────────────────────────────────────────────────
     # Max concurrent LLM calls during clause extraction.
