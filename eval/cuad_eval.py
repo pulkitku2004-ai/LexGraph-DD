@@ -321,11 +321,7 @@ def index_eval_rows(rows: list[dict], sample_ids: list[int]) -> None:
         logger.info("[eval] all %d chunks loaded from cache — skipping GPU", len(all_chunks))
 
     embedded: list[EmbeddedChunk] = [
-        EmbeddedChunk(
-            chunk=chunk,
-            vector=cache[_text_key(chunk.text)][0],
-            sparse_vector=cache[_text_key(chunk.text)][1],
-        )
+        EmbeddedChunk(chunk=chunk, vector=(e := cache[_text_key(chunk.text)])[0], sparse_vector=e[1])
         for chunk in all_chunks
     ]
 

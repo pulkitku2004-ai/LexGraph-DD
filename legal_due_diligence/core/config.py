@@ -178,20 +178,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── HyDE (Hypothetical Document Embeddings) ──────────────────────────────
-    # When enabled, the retriever asks the LLM to generate a hypothetical
-    # contract clause for each category, then embeds THAT text for the dense
-    # query instead of the keyword query string. The hypothetical clause is
-    # in the same vocabulary space as indexed contract chunks — higher recall
-    # for semantically variable clauses (e.g. "Covenant Not To Sue").
-    # Sparse query still uses the original enriched query (exact legal terms).
-    # Cost: 1 extra LLM call per retrieval (41 categories × N docs).
-    # Enabled via USE_HYDE=true in .env or settings.use_hyde = True.
-    use_hyde: bool = Field(
-        default=False,
-        description="Enable HyDE (Hypothetical Document Embeddings) for dense retrieval.",
-    )
-
     # ── Chunking strategy ────────────────────────────────────────────────────
     # Parent-child chunking (Sprint 16 revision):
     #

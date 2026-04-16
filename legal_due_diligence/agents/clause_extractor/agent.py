@@ -208,15 +208,12 @@ async def _extract_category_async(
     # ── Retrieval (sync, offloaded to thread pool) ─────────────────────────
     alt_queries = CUAD_ALT_QUERIES.get(clause_type, [])
     if alt_queries:
-        all_queries = [retrieval_query] + alt_queries
         chunks = await asyncio.to_thread(
             retrieve_multi,
-            all_queries,
+            [retrieval_query] + alt_queries,
             doc_id,
-            5,           # top_k: more chunks to LLM when multi-querying
-            20,          # candidate_k per query
-            clause_type,
-            settings.use_hyde,
+            5,   # top_k: more chunks to LLM when multi-querying
+            20,  # candidate_k per query
         )
     else:
         chunks = await asyncio.to_thread(
@@ -225,8 +222,6 @@ async def _extract_category_async(
             doc_id=doc_id,
             top_k=3,
             candidate_k=20,
-            clause_type=clause_type,
-            hyde=settings.use_hyde,
         )
 
     if not chunks:

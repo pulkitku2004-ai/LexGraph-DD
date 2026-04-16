@@ -169,9 +169,7 @@ def _compute_sparse(
         ids_nz = ids_np[nonzero]
         weights_nz = weights_np[nonzero]
 
-        # Max-aggregate weights per unique token_id using numpy for speed
-        unique_ids, first_idx = np.unique(ids_nz, return_index=True)
-        # For max: group by token_id, find max weight per group
+        # Max-aggregate weights per unique token_id
         sparse: dict[int, float] = {}
         for uid, w in zip(ids_nz.tolist(), weights_nz.tolist()):
             if w > sparse.get(uid, 0.0):

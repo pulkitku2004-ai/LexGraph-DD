@@ -1,32 +1,40 @@
 """
-Text chunker — LoadedDocument → list of Chunk objects.
+Text chunker — LoadedDocument → list of Chunk objects (parent-child, Sprint 16).
 
 Why token-based chunking instead of character or sentence-based?
-legal-bert has a 512-token hard limit. Character-based chunking can produce
-chunks that exceed this limit for dense legal text (long sentences, no
-whitespace). Token-based chunking guarantees every chunk fits in the model
-without truncation artifacts.
+bge-m3 has a 512-token inference limit. Character-based chunking can produce
+chunks that exceed this for dense legal text. Token-based chunking guarantees
+every child chunk fits within the model's window without truncation artifacts.
 
-Why 512 tokens with 128 overlap?
-- 512 = legal-bert's max sequence length. Using the full window maximises
-  the semantic content per embedding.
-- 128 token overlap (25%) prevents clause boundary splits. A limitation-of-
-  liability clause that starts at token 490 of one chunk and ends at token
-  50 of the next will be fully represented in the overlapping region.
-  Without overlap, retrieval for that clause would fail regardless of
-  query quality.
+Why parent-child chunking (2048-tok parents / 256-tok children)?
+  Children (256 tokens, 51-token overlap) are embedded for precise retrieval.
+  Small windows give the embedding model focused, high-signal text — a 256-token
+  child about indemnification embeds closer to an indemnification query than a
+  2048-token window that also contains liability caps and governing law clauses.
 
-Why split at page boundaries before chunking?
-Contracts have natural section boundaries at page breaks. Crossing a page
-boundary in a chunk risks embedding two unrelated clauses together, which
-degrades retrieval precision. We chunk within each page first, then
-concatenate residual text across pages only when a page is shorter than
-the minimum chunk size (to avoid tiny orphan chunks).
+  Parents (2048 tokens, contiguous, non-overlapping) are passed to the LLM.
+  The LLM needs full clause context — a non-compete might span 400 tokens and
+  reference definitions from 200 tokens earlier. Sending only the 256-token child
+  would truncate the operative language. The parent window provides this context.
 
-Why store page_number and char_start/end in the chunk?
-source_chunk_id must resolve to a specific location in the original document
-for the citation system in Sprint 6. page_number + char_start is the
-minimal information needed to highlight the source text in the PDF viewer.
+  Non-overlapping parents guarantee no clause text ever appears in two parent
+  windows. If parents overlapped, the retriever could send the same clause text
+  to the LLM twice — wasting context and duplicating extraction.
+
+Why 51-token child overlap?
+  Prevents clause-boundary splits within a parent. A limitation-of-liability
+  clause that starts at token 240 of one child and ends at token 20 of the next
+  will be fully represented in the overlapping region.
+
+Why work at the token-ID level rather than calling _token_chunks twice?
+  Decode→encode roundtrips can shift token boundaries. Working at token-ID level
+  throughout ensures parent and child windows are exact slices of the same token
+  sequence — no boundary drift.
+
+Why store page_number in the chunk?
+  source_chunk_id in ExtractedClause must resolve to a page number for the
+  citation system. Page-level metadata is attached at load time so it flows
+  through chunking and indexing without extra bookkeeping.
 """
 
 from __future__ import annotations

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import fitz  # pymupdf
 from docx import Document as DocxDocument
@@ -53,7 +52,7 @@ class LoadedDocument:
         return "\n\n".join(p.text for p in self.pages)
 
 
-def load_document(file_path: str, doc_id: Optional[str] = None) -> LoadedDocument:
+def load_document(file_path: str, doc_id: str | None = None) -> LoadedDocument:
     """
     Load a PDF or DOCX file and return page-level text with metadata.
     doc_id defaults to the file stem if not provided.
@@ -103,56 +102,35 @@ def _load_pdf(file_path: str, doc_id: str) -> LoadedDocument:
     )
 
 
-def _load_txt(file_path: str, doc_id: str) -> LoadedDocument:
-    text = Path(file_path).read_text(encoding="utf-8", errors="replace")
-    lines = [l for l in text.splitlines() if l.strip()]
+def _make_synthetic_pages(doc_id: str, file_path: str, lines: list[str]) -> LoadedDocument:
+    """
+    Group lines/paragraphs into synthetic ~50-unit pages and return a LoadedDocument.
+    Used by _load_txt and _load_docx, which have no real page concept.
+    """
     page_size = 50
-    synthetic_pages = [lines[i : i + page_size] for i in range(0, len(lines), page_size)]
-
-    pages: list[PagedText] = []
-    for i, group in enumerate(synthetic_pages):
-        pages.append(PagedText(
+    groups = [lines[i : i + page_size] for i in range(0, len(lines), page_size)]
+    pages = [
+        PagedText(
             doc_id=doc_id,
             file_path=file_path,
             page_number=i + 1,
             text="\n".join(group),
-            total_pages=len(synthetic_pages),
-        ))
+            total_pages=len(groups),
+        )
+        for i, group in enumerate(groups)
+    ]
+    return LoadedDocument(doc_id=doc_id, file_path=file_path, total_pages=len(groups), pages=pages)
 
-    return LoadedDocument(
-        doc_id=doc_id,
-        file_path=file_path,
-        total_pages=len(synthetic_pages),
-        pages=pages,
-    )
+
+def _load_txt(file_path: str, doc_id: str) -> LoadedDocument:
+    text = Path(file_path).read_text(encoding="utf-8", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    return _make_synthetic_pages(doc_id, file_path, lines)
 
 
 def _load_docx(file_path: str, doc_id: str) -> LoadedDocument:
+    # DOCX has no concept of "pages" — group paragraphs into synthetic ~50-unit pages
+    # so the metadata structure stays consistent with PDF output downstream.
     doc = DocxDocument(file_path)
-
-    # DOCX has no concept of "pages" — we use paragraphs as the unit.
-    # Group into synthetic ~50-paragraph "pages" so the metadata structure
-    # stays consistent with PDF output downstream.
     paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    page_size = 50
-    synthetic_pages = [
-        paragraphs[i : i + page_size]
-        for i in range(0, len(paragraphs), page_size)
-    ]
-
-    pages: list[PagedText] = []
-    for i, group in enumerate(synthetic_pages):
-        pages.append(PagedText(
-            doc_id=doc_id,
-            file_path=file_path,
-            page_number=i + 1,
-            text="\n".join(group),
-            total_pages=len(synthetic_pages),
-        ))
-
-    return LoadedDocument(
-        doc_id=doc_id,
-        file_path=file_path,
-        total_pages=len(synthetic_pages),
-        pages=pages,
-    )
+    return _make_synthetic_pages(doc_id, file_path, paragraphs)
