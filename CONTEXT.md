@@ -1,7 +1,7 @@
 # LexGraph-DD — Master Context
 
-**Last updated:** 2026-04-17
-**Status:** Sprint 19 complete. Embedding cache live — 360-row eval cold run populates 5,199 chunk hashes; subsequent runs load from disk in ~1s and skip GPU entirely (~50 min → ~2 min, 30×). R@3 = 61.4% confirmed (360-row, Apr 17). Production pipeline and LangGraph topology unchanged.
+**Last updated:** 2026-04-19
+**Status:** PROJECT CLOSED. Sprint 23 complete. Sprint 24 (JOB_STORE SQLite persistence) was in scope but project was called off after final extraction quality evaluation confirmed a model capability ceiling — not addressable without a better extraction model or contrastive fine-tuning. All retrieval and extraction improvement avenues exhausted. System is production-ready for a prototype; limitations documented below and in README.
 
 ---
 
@@ -79,6 +79,11 @@ python run_sprint1.py         # re-index after wipe (no pickle — sparse in Qdr
 | 17 | Retrieval ceiling: HyDE (−3.9pp), reranker (−9.5pp), MMR (N/A), CUAD def analysis | ✅ DONE |
 | 18 | CUAD definition-based query enrichment for bottom-tier categories | ✅ DONE |
 | 19 | Embedding cache: materialize chunk embeddings to disk — ~50 min eval → ~2 min repeat runs | ✅ DONE |
+| 20 | Anchor word injection: official CUAD definition phrases → R@3 67.5%→68.0% (+0.5pp) | ✅ DONE |
+| 21 | Hybrid alpha tuning (sparse-heavy RRF sweep α=0.7/0.8/0.9) — rejected: all worse than equal weight | ✅ DONE |
+| 22 | Case-insensitive enrichment/alt-query lookup fix + Affiliate License-Licensor alt queries → R@3 68.0%→68.3% | ✅ DONE |
+| 23 | Pipeline quality: e2e baseline ✅ + `trim_clause_text()` ✅ + risk scorer category prompts ✅ + contradiction detector fixes ✅ + extraction hints ✅ + auth ✅ | ✅ DONE |
+| 24 | Verbatim prompt test (Cond. F1 0.421→0.373, −4.8pp, rejected) → extraction quality ceiling confirmed → project closed | ✅ DONE (closed) |
 
 ---
 
@@ -86,49 +91,79 @@ python run_sprint1.py         # re-index after wipe (no pickle — sparse in Qdr
 
 ```
 Eval: chenghao/cuad_qa, 1244 rows, enrich-queries + multi-query
-R@1:  33.3%    R@3:  52.1%   (Sprint 8 baseline — full 1244 rows)
-R@3:  61.7%    (360 rows, Sprint 16, enrich + multi-query — best confirmed)
+R@1:  39.6%    R@3:  68.3%   (Sprint 22 — full 1244 rows, Apr 17, definitive)
 ```
 
 **Full progression:**
-| Config | R@3 |
-|---|---|
-| legal-bert baseline | 9% |
-| bge-base + prefix | 15% |
-| bge-m3, ck=20, enriched | 42% (100-row) → **52.1%** (1244-row) |
-| + multi-query + Sprint 16 chunking | **61.7%** (360-row) |
-| Sprint 18 query enrichment | **61.7%** (360-row, net neutral — first accurate per-category baseline established) |
-| Sprint 19 (cache-warmed run, Apr 17) | **61.4%** (360-row, confirmed — within sampling variance) |
+| Config | R@3 | Rows |
+|---|---|---|
+| legal-bert baseline | 9% | ~100 |
+| bge-base + prefix | 15% | ~100 |
+| bge-m3, ck=20, enriched | 42% → **52.1%** | 100 → 1244 |
+| + multi-query + Sprint 16 chunking | **61.7%** | 360 |
+| Sprint 18 query enrichment | **61.4%** | 360 |
+| Sprint 19 — full dataset | **67.5%** | 1244 |
+| Sprint 20 — anchor word injection | 68.0% | 1244 |
+| **Sprint 22 — enrichment fix + Affiliate License-Licensor alt** | **68.3%** | **1244** |
 
-**Rejected improvements (benchmarked):**
+**Rejected retrieval improvements (benchmarked):**
 - HyDE: −3.9pp (llama-3.1-8b generates boilerplate, shifts embeddings away from contract language)
 - Cross-encoder reranker (bge-reranker-v2-m3): −9.5pp (MS-MARCO trained, domain mismatch on legal text)
 - MMR: N/A (parent_id dedup already prevents clumping)
 - candidate_k=50 vs ck=20: +1pp, within noise — ck=20 confirmed
+- Hybrid alpha tuning (Sprint 21): α=0.7 → 67.1% (−0.9pp), α=0.8 → 67.3% (−0.7pp), α=0.9 → 66.7% (−1.3pp). bge-m3's dense and sparse vectors are jointly trained for equal-weight RRF — tilting toward sparse overweights exact-term matching and loses the semantic clustering dense provides. Equal weight (α=0.5) is optimal.
+- Multi-query expansion to new categories (Sprint 22 attempt): License Grant, Non-Transferable License, Irrevocable/Perpetual License, Non-Disparagement, ROFR/ROFO/ROFN, Termination for Convenience all caused regressions (−3 to −18pp). Change of Control alt queries caused −23.1pp (2nd alt query "assign agreement to affiliate" pulled Anti-Assignment chunks). Multi-query hurts when the added queries overlap vocabulary with adjacent categories.
+- Change of Control alt queries: removed permanently. The primary enriched query already covers the space; alt queries caused Anti-Assignment contamination.
+- Chunk size variants: 128/1024 and 512/2048 both benchmarked — 256/2048 (current) is optimal.
+- RRF_K tuning: not attempted — marginal expected gain not worth the effort at this ceiling.
 
-**Per-category worst (Sprint 18, 360-row, enriched + multi-query — first accurate measurement):**
+**Retrieval ceiling declared at R@3 = 68.3%.** Further gains require contrastive fine-tuning (paid GPU) or a fundamentally different retrieval architecture.
 
-⚠ All pre-Sprint-18 per-category numbers were from a stale hardcoded file in analyze_categories.py — now fixed.
+**Rejected extraction quality improvements (benchmarked):**
+- `trim_clause_text()` (Sprint 23): negligible effect on Token F1 (±0.003, within noise). Kept for cleaner risk/contradiction input.
+- Extraction hints for 19 categories (Sprint 23): partial run confounded by model mixing — not cleanly measurable.
+- Verbatim copy instruction in SYSTEM_PROMPT (Sprint 24): Cond. F1 0.421 → 0.373 (−4.8pp). llama-3.1-8b treats the instruction as additional constraint and degrades. **This is a model capability ceiling**, not a prompt engineering problem.
 
-| Category | R@3 | n |
-|---|---|---|
-| Most Favored Nation | 0% | 3 |
-| Non-Compete | 10% | 10 |
-| Revenue/Profit Sharing | 20% | 10 |
-| Joint IP Ownership | 29% | 7 |
-| Covenant Not To Sue | 40% | 10 |
-| IP Ownership Assignment | 40% | 10 |
-| Volume Restriction | 40% | 10 |
-| Post-Termination Services | 40% | 10 |
-| Change of Control | 40% | 10 |
-| Non-Disparagement | 43% | 7 |
+**Extraction ceiling declared at Cond. F1 ≈ 0.42 (llama-3.1-8b-instant).** Improving this requires either a larger model (e.g. llama-3.1-70b) or a CUAD fine-tuned extraction model.
+
+**Per-category breakdown (Sprint 20, full 1244-row, Apr 17 — authoritative):**
+
+| Category | R@3 | n | vs Sprint 19 |
+|---|---|---|---|
+| Most Favored Nation | 0% | 3 | — |
+| Non-Compete | 35% | 23 | +9pp ✅ |
+| Joint IP Ownership | 29% | 7 | — |
+| Unlimited/All-You-Can-Eat License | 33% | 3 | — |
+| Warranty Duration | 40% | 10 | — |
+| Revenue/Profit Sharing | 46% | 35 | +6pp ✅ |
+| Non-Disparagement | 43% | 7 | — |
+| Competitive Restriction Exception | 50% | 16 | +6pp ✅ |
+| Post-Termination Services | 52% | 29 | +7pp ✅ |
+| Covenant Not To Sue | 46% | 24 | — |
+| ROFR/ROFO/ROFN | 53% | 17 | +6pp ✅ |
+| Parties | 97% | 102 | — |
+| Document Name | 87% | 102 | — |
+| Agreement Date | 87% | 93 | — |
+| Anti-Assignment | 81% | 72 | — |
 
 Sprint 18 query enrichment changes (6 categories): net neutral on overall R@3 (61.7% → 61.7%). Per-category impact cannot be determined without a clean Sprint 17 baseline — that run also used the stale file. This is the new authoritative baseline.
 
-**E2E metrics (200-row, Sprint 15):**
-- LLM Found Rate: 78.1% (was 52% before SYSTEM_PROMPT rewrite)
-- Token F1 mean: 0.444
-- Conditional F1: 0.568
+**E2E metrics (200-row):**
+
+| Sprint | Found Rate | Token F1 mean | Cond. F1 | Substring Match | Notes |
+|---|---|---|---|---|---|
+| 15 (baseline) | 78.1% | 0.444 | — | — | 128-child / 512-parent, SYSTEM_PROMPT rewrite |
+| 23 (pre-trim) | 88.5% | 0.386 | — | 28.1% | 256-child / 2048-parent; Groq primary throughout |
+| 23 (trimmed, cached A/B) | 81.8% | 0.375 | — | 24.0% | trim=yes; same 192 LLM responses as no-trim |
+| 23 (no-trim, cached A/B) | 82.3% | 0.378 | — | 24.5% | trim=no; clean baseline |
+| 24 (model-mixed baseline) | 83.3% | 0.350 | 0.421 | 22.4% | Groq TPD hit mid-run → ollama fallback. Not authoritative. |
+| 24 (verbatim prompt, model-mixed) | 86.5% | 0.322 | 0.373 | 18.8% | Verbatim instruction added. Same confound. **Rejected −4.8pp Cond. F1.** |
+
+**Sprint 23 trimmer finding:** `trim_clause_text()` has negligible effect on token F1: +0.003 when disabled (within noise). Kept — logically correct for cleaner risk/contradiction input even if CUAD token F1 can't measure it.
+
+**Sprint 24 extraction ceiling finding:** Adding an explicit verbatim copy instruction to SYSTEM_PROMPT ("Copy the text character-for-character exactly as it appears. Do not paraphrase, summarize, or reword.") caused Cond. F1 to drop 0.421 → 0.373 (−4.8pp). The instruction confused the model — llama-3.1-8b's paraphrasing is a model capability ceiling, not a prompt engineering problem. Fixing it requires either a larger extraction model or a fine-tuned one. **Prompt reverted. Project closed.**
+
+**Note on eval confound:** Both Sprint 24 runs are model-mixed — Groq TPD exhausted (~500k tokens/day on scout-17b) and ollama/mistral-nemo handled the remainder. Clean authoritative numbers require waiting for TPD reset and using the Groq LLM cache. The cache (259 entries, `eval/cache/llm_responses_llama_3.1_8b_instant.pkl`) is restored to its pre-test state.
 
 ---
 
@@ -287,6 +322,13 @@ graph TD
 
 **LLM:** groq/llama-3.1-8b → groq/llama-4-scout → ollama/mistral-nemo. temperature=0, max_tokens=300. JSON output → parse → ExtractedClause. Any failure → found=False, confidence=0.0.
 
+**Post-extraction trimming (`trim_clause_text()` — Sprint 23):** Applied at parse time in `_parse_response()`. Strips section headers that LLM includes when 2048-token parents give it too much context. Logic:
+1. Strip leading section numbers: `12.1 ` / `12.1. ` / `3. ` (two-arm regex to avoid stripping "3 months")
+2. Strip leading `Article 12.` / `SECTION 3.1` keywords
+3. **Only if** step 1 or 2 matched: strip ALL-CAPS headers (`INDEMNIFICATION. `) and title-case headers (`Change of Control. `) — guard prevents stripping clause subjects like `LICENSEE shall not...` or `THIS AGREEMENT is made...`
+4. Strip trailing orphan numbers (`13.` at end)
+Fallback: return original text if trimming produces empty string.
+
 **Async:** asyncio.gather per doc, Semaphore(10) global cap. 50 docs: ~3–10s wall time.
 
 ---
@@ -420,6 +462,7 @@ Warm run: cache loaded in ~1s, GPU skipped, total eval ~2 min (30× speedup).
 | HuggingFace unauth rate limit warning | Set `HF_TOKEN` env var |
 | bm25 pickle duplicate on re-run | Gone — sparse vectors in Qdrant, no pickle |
 | Groq 6000 TPM per model | Fallback chain eliminates wait |
+| `e2e_eval.py` stale API (Sprint 23 fix) | `embed_questions()` returns `(primary_dict, alt_dict)` tuple — was captured as single value, crashing on `query_embeddings[idx]` for idx > 1. Fixed: `query_embeddings, _ = embed_questions(...)`. Also removed stale `query_text=` and `reranker=` kwargs from `eval_retrieve()` / `eval_retrieve_multi()` calls, and removed `CrossEncoder` import and `--reranker` CLI arg. |
 
 ---
 
@@ -454,3 +497,5 @@ docker compose down -v && docker compose up -d && python run_sprint1.py
 | Payment Terms | 30 days | 45 days |
 | Confidentiality | 5 years | 3 years |
 | Termination | 30 days notice | **missing** |
+
+

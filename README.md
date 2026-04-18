@@ -172,44 +172,90 @@ Terminal agent — reads full state, produces two outputs:
 
 ---
 
-## Retrieval Performance (CUAD Benchmark)
+## Performance
+
+### Retrieval (CUAD Benchmark)
 
 Evaluated on [`chenghao/cuad_qa`](https://huggingface.co/datasets/chenghao/cuad_qa) — 1,244 test rows across 41 legal clause categories.
 
-| Retrieval Setup | Recall@1 | Recall@3 | Notes |
+| Retrieval Setup | R@1 | R@3 | Notes |
 |---|---|---|---|
-| legal-bert baseline | — | ~9% | Dense only |
+| legal-bert baseline | — | 9% | Dense only |
 | bge-base dense-only | ~10% | ~15% | With query prefix |
-| bge-m3 hybrid sparse+dense+RRF | **33.3%** | **52.1%** | 1,244 rows — established benchmark |
-| + parent-child chunking (256/2048) | — | — | Combined below |
-| + multi-query for hard categories | — | — | Combined below |
-| + CUAD definition query enrichment | **26.1%** | **61.4%** | 360-row sample, all improvements combined |
+| bge-m3 hybrid sparse+dense+RRF | 33.3% | 52.1% | 1,244 rows |
+| + parent-child chunking (256/2048) | — | 61.7% | Sprint 16 |
+| + CUAD definition query enrichment | — | 67.5% | Sprint 18–20 |
+| + enrichment fix + alt query tuning | **39.6%** | **68.3%** | **Sprint 22 — final, 1,244 rows** |
 
-**3× improvement** over the dense-only baseline at Recall@3. Parent-child chunking (Sprint 16) delivers longer context to the LLM while keeping embeddings focused on dense child passages. Multi-query retrieval (+6pp) fires 2–3 alternative phrasings for 15 hard categories and sums RRF scores before deduplication.
+**3× improvement** over the dense-only baseline. Parent-child chunking keeps embeddings focused on 256-token children while delivering 2048-token parent context to the LLM. Multi-query retrieval (+6.1pp) fires 2–3 alternative phrasings for 15 hard categories and sums RRF scores before deduplication.
 
-**Approaches evaluated and rejected:**
+**Retrieval ceiling declared at R@3 = 68.3%.** Further gains require contrastive fine-tuning on CUAD or a fundamentally different architecture.
 
-| Approach | R@3 delta | Reason |
-|---|---|---|
-| HyDE (Hypothetical Document Embeddings) | −3.9pp | LLM generates boilerplate; shifts embeddings away from contract language |
-| Cross-encoder reranker (bge-reranker-v2-m3) | −9.5pp | MS-MARCO trained; domain mismatch on legal text |
+**Per-category breakdown (1,244-row run, selected categories):**
 
-**Per-category breakdown (360-row run, worst categories):**
-
-| Category | Recall@3 | n |
+| Category | R@3 | n |
 |---|---|---|
 | Most Favored Nation | 0% | 3 |
-| Non-Compete | 10% | 10 |
-| Revenue/Profit Sharing | 20% | 10 |
+| Non-Compete | 35% | 23 |
 | Joint IP Ownership | 29% | 7 |
-| Covenant Not To Sue | 40% | 10 |
-| Change of Control | 40% | 10 |
-| IP Ownership Assignment | 40% | 10 |
-| Non-Disparagement | 43% | 7 |
-| Parties | 100% | 10 |
-| Document Name | 90% | 10 |
+| Revenue/Profit Sharing | 46% | 35 |
+| Post-Termination Services | 52% | 29 |
+| Covenant Not To Sue | 46% | 24 |
+| Anti-Assignment | 81% | 72 |
+| Agreement Date | 87% | 93 |
+| Document Name | 87% | 102 |
+| Parties | 97% | 102 |
 
-Hard categories (0–29%) are retrieval-ceiling problems — the clause is present but uses vocabulary far removed from its category name, and no query enrichment recovers it without fine-tuning.
+Hard categories (0–35%) are vocabulary-gap problems — the clause is present but uses language far removed from its CUAD category name. Query enrichment and multi-query recovered most of the gap; the remainder requires fine-tuned embeddings.
+
+### Extraction Quality (End-to-End)
+
+Evaluated on 192 rows from the same CUAD test set — measures whether the LLM correctly extracts the clause text given retrieved context.
+
+| Metric | Value |
+|---|---|
+| Found Rate | ~83% |
+| Token F1 (mean) | ~0.35 |
+| Conditional F1 (when found=True) | ~0.42 |
+| Substring Match | ~22% |
+
+**Extraction ceiling declared at Cond. F1 ≈ 0.42.** The primary limiting factor is the extraction model (llama-3.1-8b-instant) paraphrasing rather than copying verbatim. This is a model capability ceiling, not a retrieval or prompt engineering problem — see [What Was Evaluated](#what-was-evaluated) below.
+
+---
+
+## What Was Evaluated
+
+Every approach that was tested and either kept or rejected, in the order it was tried.
+
+### Retrieval
+
+| Approach | R@3 Delta | Verdict | Why |
+|---|---|---|---|
+| Dense-only (legal-bert) | baseline 9% | Rejected | Domain-specific but small model, no sparse signal |
+| bge-base + query prefix | +6pp | Superseded | Replaced by bge-m3 |
+| bge-m3 hybrid dense+sparse RRF | +37pp over baseline | **Kept** | Single model, jointly trained dense+sparse vectors — no need for a separate BM25 index |
+| HyDE (Hypothetical Document Embeddings) | −3.9pp | **Rejected** | llama-3.1-8b generates generic boilerplate; shifts query embeddings away from real contract language |
+| Cross-encoder reranker (bge-reranker-v2-m3) | −9.5pp | **Rejected** | MS-MARCO trained on web/news; legal text domain mismatch causes consistent regression |
+| MMR (Maximal Marginal Relevance) | N/A | **Rejected** | parent_id dedup already prevents the clumping MMR solves — no additional gain |
+| candidate_k=50 vs k=20 | +1pp | **Rejected** | Within noise; k=20 confirmed optimal |
+| Parent-child chunking 128/1024 | baseline 61.7% | Superseded | Replaced by 256/2048 |
+| Parent-child chunking 512/2048 | worse | **Rejected** | 512-child embeddings too broad; lose precision |
+| Parent-child chunking 256/2048 | +6.1pp | **Kept** | Optimal: focused child embeddings + long parent context for LLM |
+| Multi-query for 15 hard categories | +6.1pp | **Kept** | RRF score summing across alt queries gives vocabulary coverage without false positive leakage |
+| Multi-query expansion to 6 new categories | −3 to −23pp | **Rejected** | Alt queries for License Grant, Non-Disparagement, ROFR/ROFO/ROFN, Change of Control all caused leakage into adjacent categories (Anti-Assignment contamination worst case: −23pp) |
+| Hybrid alpha tuning (α=0.7/0.8/0.9) | −0.7 to −1.3pp | **Rejected** | bge-m3 dense+sparse are jointly trained for equal-weight fusion; tilting toward sparse overweights exact-term matching and loses semantic clustering |
+| CUAD definition query enrichment (6 categories) | +0.8pp net | **Kept** | Anchor words from official CUAD definitions injected into queries for bottom-tier categories |
+| Case-insensitive enrichment lookup fix | +0.3pp | **Kept** | Bug fix; enrichment was silently failing on mixed-case category names |
+| RRF_K parameter tuning | Not attempted | Skipped | Marginal expected gain insufficient to justify the effort at R@3 = 68.3% |
+
+### Extraction Quality
+
+| Approach | Cond. F1 Delta | Verdict | Why |
+|---|---|---|---|
+| SYSTEM_PROMPT rewrite (Sprint 14) | baseline established | **Kept** | Structured JSON schema, found/clause_text/normalized_value separation, substance-over-label instruction |
+| Extraction hints for 19 categories (Sprint 23) | Confounded | **Kept** | Run was model-mixed (Groq TPD hit → ollama fallback); improvement not cleanly measurable but logically sound |
+| `trim_clause_text()` — strip section headers (Sprint 23) | ±0.003 (noise) | **Kept** | Negligible Token F1 effect, but produces cleaner input for risk scorer and contradiction detector |
+| Verbatim copy instruction in SYSTEM_PROMPT (Sprint 24) | −4.8pp | **Rejected** | "Copy character-for-character, do not paraphrase" confused the model — llama-3.1-8b degraded under the additional constraint. This is a model capability ceiling, not a prompt problem. |
 
 ---
 
@@ -219,15 +265,15 @@ This is a working research prototype. Before deploying in a production legal env
 
 | Limitation | Detail |
 |---|---|
-| **No authentication** | The FastAPI layer has no auth. All jobs and reports are accessible to anyone who can reach the server. |
-| **In-memory job store** | Jobs live in a Python dict — they are lost on server restart. A Redis or Postgres-backed store is needed for production. |
-| **No job persistence across restarts** | Closely related: if the server crashes mid-pipeline, the job is gone. |
-| **Rate-limit dependency** | The extraction pipeline makes ~2,050 LLM calls per 50-document job. Groq's free tier (6,000 TPM) can throttle large batches without the local Ollama fallback running. |
+| **Extraction quality ceiling** | Conditional F1 ≈ 0.42 on CUAD. The extraction LLM (llama-3.1-8b-instant) paraphrases rather than copying verbatim. Fixing this requires a larger model (70B+) or a CUAD fine-tuned extraction model — neither is addressable with prompt engineering alone. |
+| **Retrieval ceiling on hard categories** | Most Favored Nation (0%), Non-Compete (35%), Joint IP Ownership (29%) remain low after all enrichment. Root cause: clause vocabulary diverges significantly from category name. Requires contrastive fine-tuning on CUAD (paid GPU). |
+| **In-memory job store** | Jobs live in a Python dict — lost on server restart. A SQLite or Postgres-backed store is needed for production durability. |
+| **Rate-limit dependency** | The extraction pipeline makes ~2,050 LLM calls per 50-document job. Groq's free tier (500k tokens/day on scout-17b) can exhaust mid-run on large batches; the local Ollama fallback is slower and produces lower-quality output. |
 | **English-only** | bge-m3 is multilingual but the CUAD prompts and risk rules are English-only. Non-English contracts will retrieve correctly but extract poorly. |
-| **No document deduplication** | Uploading the same contract twice creates duplicate vectors and graph nodes. Qdrant `MERGE` handles the graph safely, but vector duplicates inflate retrieval noise. |
-| **Retrieval ceiling on hard categories** | Most Favored Nation (0%), Non-Compete (10%), Revenue/Profit Sharing (20%) remain low after query enrichment and multi-query. Root cause: clause vocabulary diverges significantly from category name. Requires fine-tuned embeddings or extraction model. |
+| **No document deduplication** | Uploading the same contract twice creates duplicate vectors. Qdrant MERGE handles the graph safely, but vector duplicates inflate retrieval noise. |
 | **No PDF table/form extraction** | PyMuPDF extracts text flow only. Contracts with obligation tables or signature blocks in PDF form fields may lose structured data. |
-| **No fine-tuned extraction model** | Extraction uses a general-purpose LLM. A fine-tuned model on CUAD would improve accuracy significantly on low-recall categories. |
+| **Contradiction detection depends on Neo4j** | If Neo4j is unavailable, the contradiction detector returns an empty list silently. The report notes the skip, but the user may not realise contradictions were not checked. |
+| **LLM-generated explanations are not verified** | Risk flag reasons and contradiction explanations are LLM outputs — they can hallucinate. All LLM-generated text should be treated as a starting point for lawyer review, not a legal conclusion. |
 
 ---
 

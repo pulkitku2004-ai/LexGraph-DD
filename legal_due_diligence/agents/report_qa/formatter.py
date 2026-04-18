@@ -63,20 +63,20 @@ def _format_risk_table(risk_flags: list[RiskFlag]) -> str:
 
 def _format_contradiction_table(contradictions: list[Contradiction]) -> str:
     """
-    Build a cross-document contradiction table.
+    Build a cross-document contradiction table sorted by risk level (HIGH first).
     Returns markdown string. Returns empty-section note if none.
     """
     if not contradictions:
         return "*No cross-document contradictions detected.*\n"
 
     lines = [
-        "| Clause Type | Document A | Value A | Document B | Value B | Explanation |",
-        "|---|---|---|---|---|---|",
+        "| Risk | Clause Type | Document A | Value A | Document B | Value B | Explanation |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for c in sorted(contradictions, key=lambda x: x.clause_type):
+    for c in sorted(contradictions, key=lambda x: (_RISK_ORDER.get(x.risk_level, 3), x.clause_type)):
         expl = c.explanation[:120].replace("|", "\\|")
         lines.append(
-            f"| {c.clause_type} | {c.document_id_a} | {c.value_a} "
+            f"| {c.risk_level.upper()} | {c.clause_type} | {c.document_id_a} | {c.value_a} "
             f"| {c.document_id_b} | {c.value_b} | {expl} |"
         )
     return "\n".join(lines) + "\n"
@@ -138,9 +138,9 @@ def build_narrative_prompt(state: GraphState) -> str:
     # Contradiction summary — contradictions are conflicts between clauses that
     # EXIST in both documents but have different values. They are NOT missing clauses.
     contradiction_summary = "\n".join(
-        f"  - {c.clause_type}: {c.document_id_a}={c.value_a!r} vs "
+        f"  - [{c.risk_level.upper()}] {c.clause_type}: {c.document_id_a}={c.value_a!r} vs "
         f"{c.document_id_b}={c.value_b!r}"
-        for c in state.contradictions
+        for c in sorted(state.contradictions, key=lambda x: _RISK_ORDER.get(x.risk_level, 3))
     ) or "  (none)"
 
     return f"""You are preparing a legal due diligence brief for a lawyer.
@@ -201,7 +201,7 @@ def assemble_report(
 **Generated:** {generated_at}
 **Documents reviewed:** {len(state.documents)} — {doc_list}
 **Risk flags:** {len(state.risk_flags)} (HIGH={high}, MEDIUM={medium})
-**Contradictions:** {len(state.contradictions)}
+**Contradictions:** {len(state.contradictions)}{f" (HIGH={sum(1 for c in state.contradictions if c.risk_level == 'high')})" if state.contradictions else ""}
 
 ---
 

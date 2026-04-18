@@ -47,12 +47,28 @@ _PKG_ROOT = Path(__file__).parent.parent  # → legal_due_diligence/
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Security, UploadFile
 from fastapi.responses import Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api.runner import JOB_STORE, create_job, delete_job, run_pipeline
 from api.schemas import Citation, JobResponse, JobStatus, QARequest, QAResponse
+from core.config import settings
 from infrastructure.neo4j_client import close_neo4j_driver
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# auto_error=False so we return a clean 401 instead of FastAPI's default 403.
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _verify_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> None:
+    """Dependency — enforces Bearer token auth when API_KEY is configured."""
+    if not settings.api_key:
+        return  # auth disabled in dev (API_KEY not set)
+    if credentials is None or credentials.credentials != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +100,7 @@ def _shutdown() -> None:
 async def submit_job(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(..., description="PDF or DOCX contract files"),
+    _: None = Depends(_verify_api_key),
 ) -> JobResponse:
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required.")
@@ -121,7 +138,7 @@ async def submit_job(
     summary="Poll job status",
     description="Returns current status. When status='done', the 'report' field contains the full markdown brief.",
 )
-def get_job(job_id: str) -> JobResponse:
+def get_job(job_id: str, _: None = Depends(_verify_api_key)) -> JobResponse:
     record = JOB_STORE.get(job_id)
     if not record:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -141,7 +158,7 @@ def get_job(job_id: str) -> JobResponse:
     summary="Ask a question about a completed job",
     description="Runs hybrid retrieval across all documents in the job and returns a grounded answer with citations.",
 )
-def qa(job_id: str, request: QARequest) -> QAResponse:
+def qa(job_id: str, request: QARequest, _: None = Depends(_verify_api_key)) -> QAResponse:
     record = JOB_STORE.get(job_id)
     if not record:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -177,7 +194,7 @@ def qa(job_id: str, request: QARequest) -> QAResponse:
     summary="Delete a job and all its data",
     description="Removes Qdrant vectors, Neo4j graph nodes, and uploaded files for this job.",
 )
-def delete(job_id: str, background_tasks: BackgroundTasks) -> Response:
+def delete(job_id: str, background_tasks: BackgroundTasks, _: None = Depends(_verify_api_key)) -> Response:
     if job_id not in JOB_STORE:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     record = JOB_STORE[job_id]

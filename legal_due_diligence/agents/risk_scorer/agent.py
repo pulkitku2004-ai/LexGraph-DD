@@ -85,10 +85,85 @@ Rules:
 - "reason" must be one concise sentence explaining the risk or why the clause is acceptable.
 - Be conservative: flag ambiguous or one-sided language. Do not flag standard mutual obligations."""
 
+# Per-category criteria injected into the assessment prompt.
+# Each entry tells the LLM exactly what to look for — without this, the model
+# applies generic legal intuition and produces inconsistent risk levels.
+_CATEGORY_RISK_CRITERIA: dict[str, str] = {
+    "Limitation of Liability": (
+        "This clause is about damage TYPE exclusions, not cap amounts (that is Liability Cap). "
+        "Flag HIGH if: consequential, indirect, or punitive damages are NOT excluded, leaving "
+        "open-ended exposure to loss-of-profit or speculative claims. "
+        "Flag MEDIUM if: exclusions are one-sided (only one party gets the protection), or "
+        "standard carve-outs for gross negligence, fraud, or wilful misconduct are absent. "
+        "Do NOT flag if: consequential/indirect damages are mutually excluded and standard "
+        "carve-outs exist. Do NOT comment on cap amounts — that is assessed separately."
+    ),
+    "Liability Cap": (
+        "Flag HIGH if: no specific cap amount or formula is stated, or the cap is less than "
+        "3 months of fees. Flag MEDIUM if: the cap applies asymmetrically (one party capped, "
+        "other is not), or the cap resets annually giving an illusion of limits. "
+        "Do NOT flag if: a reasonable mutual cap (12–24 months of fees or fixed amount) is stated."
+    ),
+    "Indemnification": (
+        "Flag HIGH if: indemnification is one-sided (only one party indemnifies), covers "
+        "consequential/indirect losses without a cap, or there is no control-of-defense provision. "
+        "Flag MEDIUM if: indemnification scope is unusually broad (e.g. 'any claim arising from "
+        "the agreement'), or IP indemnification is absent when IP is being licensed or assigned. "
+        "Do NOT flag if: indemnification is mutual, capped, and limited to third-party claims."
+    ),
+    "IP Ownership Assignment": (
+        "Flag HIGH if: all IP created under the agreement (including pre-existing background IP) "
+        "is assigned to the counterparty, or the clause is silent on background IP ownership. "
+        "Flag MEDIUM if: the assignment scope is ambiguous ('related to the agreement' without "
+        "defining scope), or there is no licence-back for background IP. "
+        "Do NOT flag if: only foreground IP (created specifically for this contract) is assigned "
+        "and background IP is explicitly retained."
+    ),
+    "Non-Compete": (
+        "Flag HIGH if: the non-compete applies post-termination for more than 2 years, covers "
+        "an entire industry rather than specific competing products/services, or has no "
+        "geographic limitation. Flag MEDIUM if: the scope is broader than the actual business "
+        "relationship (e.g. bans all software development when the contract is for one product), "
+        "or applies during the term with no carve-out for pre-existing business. "
+        "Do NOT flag if: restricted to directly competing products/services, limited duration "
+        "(≤1 year post-term), and reasonable geographic scope."
+    ),
+    "Governing Law": (
+        "Flag MEDIUM if: the governing law is a non-standard or obscure jurisdiction "
+        "(outside Delaware, New York, California, England & Wales, Singapore, Hong Kong), "
+        "or governing law and dispute resolution venue are specified in different jurisdictions "
+        "(creates enforcement conflict). "
+        "Do NOT flag if: any standard commercial jurisdiction is specified "
+        "(Delaware, New York, California, England & Wales, Singapore, Hong Kong) — "
+        "jurisdiction preference is not a risk. Do NOT flag solely because the jurisdiction "
+        "differs from what you assume the reviewer's home state to be."
+    ),
+    "Termination for Convenience": (
+        "Flag HIGH if: only one party has termination-for-convenience rights (asymmetric exit). "
+        "Flag MEDIUM if: the notice period is unusually long (>90 days), there is a termination "
+        "fee or penalty for exercising this right, or payment obligations continue past the "
+        "termination effective date without a pro-rata wind-down. "
+        "Do NOT flag if: both parties have mutual termination-for-convenience rights with a "
+        "reasonable notice period (30–60 days) and no penalty."
+    ),
+    "Confidentiality": (
+        "Flag HIGH if: confidentiality obligations are one-sided (only one party is bound), "
+        "there is no time limit on obligations (perpetual confidentiality of operational data "
+        "is unreasonable), or standard exclusions (publicly known, independently developed, "
+        "received from third party) are absent. Flag MEDIUM if: the obligation term exceeds "
+        "5 years for general business information, or the definition of confidential information "
+        "is so broad it captures publicly available information. "
+        "Do NOT flag if: obligations are mutual, duration is 2–5 years, and standard exclusions "
+        "are present."
+    ),
+}
+
 
 def _build_assessment_prompt(clause: ExtractedClause) -> str:
+    criteria = _CATEGORY_RISK_CRITERIA.get(clause.clause_type, "")
+    criteria_block = f"\nAssessment criteria for this clause type:\n{criteria}\n" if criteria else ""
     return f"""Assess this "{clause.clause_type}" clause for legal risk.
-
+{criteria_block}
 Document: {clause.document_id}
 Clause text: {clause.clause_text or "(not available)"}
 Extracted value: {clause.normalized_value or "(not available)"}

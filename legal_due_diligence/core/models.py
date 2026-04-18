@@ -59,3 +59,4 @@ class Contradiction(BaseModel):
     value_a: str
     value_b: str
     explanation: str
+    risk_level: Literal["high", "medium", "low"] = "medium"

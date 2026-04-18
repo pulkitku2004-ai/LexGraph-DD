@@ -123,36 +123,36 @@ _CUAD_QUERY_ENRICHMENT: dict[str, str] = {
     "Notice Period to Terminate Renewal": "notice period terminate renewal cancel non-renewal written notice",
     "Governing Law":                    "governing law jurisdiction choice of law state",
     "Dispute Resolution":               "dispute resolution arbitration litigation venue court",
-    "Non-Compete":                      "non-compete non-competition restrictive covenant shall not compete competing business competing products competing services engage in competition",
-    "Exclusivity":                      "exclusivity exclusive rights sole provider",
+    "Non-Compete":                      "non-compete non-competition restrictive covenant shall not directly or indirectly compete engage in competitive activity competing entity competing business products services",
+    "Exclusivity":                      "exclusivity sole and exclusive rights sole provider co-exclusive basis exclusive right to promote distribute sell",
     "No-Solicit of Customers":          "no solicit customers non-solicitation clients",
     "No-Solicit Of Customers":          "shall not directly or indirectly solicit divert customers clients accounts business of the other party",
     "No-Solicit of Employees":          "no solicit employees hire recruit personnel",
     "No-Solicit Of Employees":          "no solicit employees hire recruit personnel",
     "Non-Disparagement":                "non-disparagement disparage negative statements derogatory defamatory comments refrain from speaking negatively",
-    "Covenant Not To Sue":              "covenant not to sue release claims waive right to bring action not assert legal claims discharge not contest challenge attack impair title trademark validity ownership",
+    "Covenant Not To Sue":              "covenant not to sue shall not institute initiate legal proceeding releases forever discharges waive right to bring action not assert claims not contest challenge attack validity ownership",
     "Limitation of Liability":          "limitation of liability indirect consequential damages excluded",
     "Liability Cap":                    "liability cap maximum total aggregate liability shall not exceed",
     "Liquidated Damages":               "liquidated damages penalty breach fixed amount",
     "Uncapped Liability":               "uncapped liability unlimited liability gross negligence fraud",
     "Indemnification":                  "indemnification indemnify hold harmless defend claims losses",
-    "IP Ownership Assignment":          "intellectual property ownership assignment work made for hire all right title interest vests assigns work product inventions",
-    "Joint IP Ownership":               "joint IP ownership jointly owned co-owned each party owns co-invented jointly developed jointly created intellectual property shared ownership both parties",
-    "License Grant":                    "license grant licensed rights use software platform",
+    "IP Ownership Assignment":          "intellectual property ownership assignment hereby assigns irrevocably assigns all developments improvements inventions shall vest in work made for hire all right title interest",
+    "Joint IP Ownership":               "joint IP ownership jointly owned co-owned each party shall own undivided interest co-invented jointly developed jointly created intellectual property shared ownership both parties",
+    "License Grant":                    "license grant hereby grants licensee non-exclusive exclusive right to use reproduce distribute sublicense make sell software platform technology content",
     "Non-Transferable License":         "non-transferable license cannot assign sublicense transfer",
     "Irrevocable or Perpetual License": "irrevocable perpetual license permanent rights",
     "Source Code Escrow":               "source code escrow deposit release conditions",
     "IP Restriction":                   "intellectual property restrictions permitted use limitations",
-    "Warranty Duration":                "warranty period duration months years guarantee defect rejection return expiration date outdated product",
+    "Warranty Duration":                "warranty period for a period of months from date of delivery acceptance warranty expires guarantee defect rejection return",
     "Product Warranty":                 "product warranty performance fitness merchantability",
     "Payment Terms":                    "payment terms invoice due date net days fees",
-    "Revenue/Profit Sharing":           "revenue sharing profit sharing royalty percentage net receipts gross revenue net sales proceeds equal to per unit",
+    "Revenue/Profit Sharing":           "revenue sharing profit sharing royalty rate percent of net revenue gross sales proceeds per unit equal to",
     "Price Restrictions":               "price restrictions most favored nation pricing cap",
-    "Most Favored Nation":              "most favored nation MFN no less favorable price terms any third party",
-    "Minimum Commitment":               "minimum commitment purchase volume guaranteed amount",
-    "Volume Restriction":               "volume restriction maximum usage limit quota not to exceed seats users copies units annual cap",
+    "Most Favored Nation":              "most favored nation MFN no less favorable than prices terms offered to any other customer licensee third party",
+    "Minimum Commitment":               "minimum commitment shall maintain at least minimum number sales representatives staff guaranteed amount purchase volume",
+    "Volume Restriction":               "volume restriction shall not exceed no more than capped at maximum usage limit authorized seats copies units per month year capacity threshold",
     "Audit Rights":                     "audit rights inspect records books financial",
-    "Post-Termination Services":        "post-termination services transition assistance wind-down following termination survival obligations continue after termination data return",
+    "Post-Termination Services":        "post-termination services upon termination after expiration continue to provide transition assistance wind-down perform obligations for a period following termination",
     "Change of Control":                "change of control merger acquisition beneficial ownership voting securities controlling interest majority shares takeover consent assignment terminate",
     "Anti-Assignment":                  "anti-assignment cannot assign transfer consent required",
     "Third Party Beneficiary":          "third party beneficiary rights benefits",
@@ -162,9 +162,9 @@ _CUAD_QUERY_ENRICHMENT: dict[str, str] = {
     "Termination for Cause":            "termination for cause material breach cure period",
     "Affiliate License-Licensor":       "affiliate license licensor grant rights related entities sublicense",
     "Affiliate License-Licensee":       "affiliate license licensee sublicense grant related entities rights",
-    "Competitive Restriction Exception": "notwithstanding competitive restriction exception carve-out permitted competing business activities despite exclusivity non-compete",
-    "Rofr/Rofo/Rofn":                   "right of first refusal offer negotiation ROFR preemptive right purchase",
-    "Cap on Liability":                 "cap on liability maximum aggregate liability shall not exceed ceiling",
+    "Competitive Restriction Exception": "notwithstanding the foregoing competitive restriction exception carve-out provided however nothing herein shall prevent permitted activities despite exclusivity non-compete",
+    "Rofr/Rofo/Rofn":                   "right of first refusal offer negotiation ROFR ROFO ROFN preemptive right prior to selling to any third party first right to purchase negotiate",
+    "Cap on Liability":                 "cap on liability in no event shall total liability be limited maximum aggregate shall not exceed ceiling",
     "Unlimited/All-You-Can-Eat-License": "unlimited non-exclusive perpetual irrevocable royalty free worldwide license unrestricted use all-you-can-eat",
 }
 
@@ -369,9 +369,12 @@ def embed_questions(
       - alt_embeddings: {category: [(dense, sparse), ...]} pre-batched for multi-query,
         so the eval loop does a dict lookup instead of a per-row GPU call.
     """
+    _enrich_ci = {k.lower(): v for k, v in _CUAD_QUERY_ENRICHMENT.items()}
+    _alts_ci = {k.lower(): v for k, v in CUAD_ALT_QUERIES.items()}
+
     def _query_text(idx: int) -> str:
         q = rows[idx]["question"]
-        enriched = _CUAD_QUERY_ENRICHMENT.get(q, q) if enrich_queries else q
+        enriched = _enrich_ci.get(q.lower(), q) if enrich_queries else q
         return query_prefix + enriched
 
     question_chunks = [
@@ -390,12 +393,12 @@ def embed_questions(
     alt_embeddings: dict[str, list[tuple[list[float], dict[int, float]]]] = {}
     if multi_query and CUAD_ALT_QUERIES:
         present_categories = {rows[idx]["question"] for idx in sample_ids}
-        cats_with_alts = [c for c in present_categories if c in CUAD_ALT_QUERIES]
+        cats_with_alts = [c for c in present_categories if c.lower() in _alts_ci]
         if cats_with_alts:
             flat: list[tuple[str, str]] = [
                 (cat, (query_prefix + q) if query_prefix else q)
                 for cat in cats_with_alts
-                for q in CUAD_ALT_QUERIES[cat]
+                for q in _alts_ci[cat.lower()]
             ]
             alt_chunks = [
                 Chunk(chunk_id=str(uuid.uuid4()), doc_id="__query__", file_path="",

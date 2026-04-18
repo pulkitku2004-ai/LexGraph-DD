@@ -67,8 +67,10 @@ Why token F1 instead of exact match?
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import pickle
 import re
 import string
 import sys
@@ -87,12 +89,14 @@ from agents.clause_extractor.prompts import (
     CUAD_CATEGORIES,
     SYSTEM_PROMPT,
     build_extraction_prompt,
+    trim_clause_text,
 )
 from core.config import get_settings
 
 # Import eval infrastructure from cuad_eval — single source of truth for
 # collection setup, indexing, retrieval, and dataset loading.
 from eval.cuad_eval import (  # type: ignore[import]
+    CACHE_DIR,
     EVAL_COLLECTION,
     RESULTS_DIR,
     SAMPLE_IDS_PATH,
@@ -108,18 +112,39 @@ from eval.cuad_eval import (  # type: ignore[import]
 )
 from agents.clause_extractor.prompts import CUAD_ALT_QUERIES
 
-try:
-    from sentence_transformers import CrossEncoder as _CrossEncoder
-    _HAVE_ST = True
-except ImportError:
-    _HAVE_ST = False
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# ── LLM response cache ────────────────────────────────────────────────────────
+
+def _llm_cache_path() -> Path:
+    settings = get_settings()
+    slug = settings.llm_extraction_model.split("/")[-1].lower().replace("-", "_")
+    return CACHE_DIR / f"llm_responses_{slug}.pkl"
+
+
+def _load_llm_cache() -> dict[str, str]:
+    path = _llm_cache_path()
+    if path.exists():
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return {}
+
+
+def _save_llm_cache(cache: dict[str, str]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    with open(_llm_cache_path(), "wb") as f:
+        pickle.dump(cache, f)
+
+
+def _llm_key(user_prompt: str) -> str:
+    """MD5 of system + user prompt — deterministic key for temperature=0 calls."""
+    return hashlib.md5((SYSTEM_PROMPT + user_prompt).encode()).hexdigest()
 
 
 # ── Token F1 (SQuAD-style) ────────────────────────────────────────────────────
@@ -165,21 +190,46 @@ def substring_match(prediction: str, ground_truth: str) -> bool:
 
 # ── LLM extraction ────────────────────────────────────────────────────────────
 
+_EXTRACTION_SENTINEL = {"found": False, "clause_text": None, "normalized_value": None, "confidence": 0.0}
+
+
+def _parse_raw(raw: str, clause_type: str) -> dict[str, Any]:
+    """Strip markdown fences and JSON-parse an LLM response string."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.debug("[e2e] JSON parse error for '%s': %s", clause_type, e)
+        return _EXTRACTION_SENTINEL
+
+
 def extract_with_llm(
     clause_type: str,
     retrieved_texts: list[str],
     doc_id: str,
+    llm_cache: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Call the extraction LLM using the same prompt as the production agent.
     Returns the parsed JSON dict, or a sentinel on failure.
 
-    Uses the synchronous litellm.completion path — the eval is
-    intentionally sequential for readable progress logs.
+    llm_cache: if provided, check before calling the LLM and store the raw
+    response string on a cache miss. key = MD5(system_prompt + user_prompt).
+    temperature=0 guarantees identical inputs → identical outputs, so caching
+    is safe. Subsequent eval runs (e.g. after trim_clause_text changes) skip
+    all LLM calls and go straight to the parse step.
     """
     settings = get_settings()
     prompt = build_extraction_prompt(clause_type, retrieved_texts, doc_id)
 
+    # ── Cache check ────────────────────────────────────────────────────────
+    if llm_cache is not None:
+        key = _llm_key(prompt)
+        if key in llm_cache:
+            return _parse_raw(llm_cache[key], clause_type)
+
+    # ── LLM call ──────────────────────────────────────────────────────────
     try:
         response = litellm.completion(
             model=settings.llm_extraction_model,
@@ -194,18 +244,14 @@ def extract_with_llm(
         )
         raw = (response.choices[0].message.content or "").strip()
 
-        # Strip markdown fences the LLM sometimes wraps around JSON
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
+        if llm_cache is not None:
+            llm_cache[key] = raw
 
-        return json.loads(raw)
+        return _parse_raw(raw, clause_type)
 
-    except json.JSONDecodeError as e:
-        logger.debug("[e2e] JSON parse error for '%s': %s", clause_type, e)
-        return {"found": False, "clause_text": None, "normalized_value": None, "confidence": 0.0}
     except Exception as e:
         logger.debug("[e2e] LLM call failed for '%s': %s", clause_type, e)
-        return {"found": False, "clause_text": None, "normalized_value": None, "confidence": 0.0}
+        return _EXTRACTION_SENTINEL
 
 
 # ── Main eval loop ────────────────────────────────────────────────────────────
@@ -218,14 +264,17 @@ def run_e2e_eval(
     candidate_k: int = 20,
     enrich_queries: bool = False,
     multi_query: bool = False,
-    reranker: Any = None,
-    reranker_name: str = "",
+    llm_cache: dict[str, str] | None = None,
+    apply_trim: bool = True,
 ) -> dict[str, Any]:
     """
     For each sampled row:
       1. Retrieve top-K chunks (hybrid RRF ± reranker ± multi-query)
       2. Call LLM extraction with the production prompt
       3. Score extracted clause_text vs ground-truth with token F1
+
+    apply_trim: if False, skip trim_clause_text() — used for A/B comparison
+    against cached responses to isolate the trimmer's effect.
 
     Returns full results dict with per-row details + aggregate metrics.
     """
@@ -234,6 +283,8 @@ def run_e2e_eval(
 
     settings = get_settings()
     per_row: list[dict] = []
+    _enrich_ci = {k.lower(): v for k, v in _CUAD_QUERY_ENRICHMENT.items()}
+    _alts_ci = {k.lower(): v for k, v in CUAD_ALT_QUERIES.items()}
 
     # Aggregate counters
     retrieval_hits3 = 0
@@ -255,12 +306,8 @@ def run_e2e_eval(
 
         ground_truth = answer_texts[0]
         query_dense, query_sparse = query_embeddings[idx]
-        query_text = (
-            _CUAD_QUERY_ENRICHMENT.get(question, question) if enrich_queries else question
-        )
-
         # ── Retrieval ─────────────────────────────────────────────────────
-        alt_queries = CUAD_ALT_QUERIES.get(question, []) if multi_query else []
+        alt_queries = _alts_ci.get(question.lower(), []) if multi_query else []
         if alt_queries:
             alt_chunks = [
                 Chunk(
@@ -276,21 +323,17 @@ def run_e2e_eval(
             ]
             retrieved = eval_retrieve_multi(
                 query_pairs=query_pairs,
-                query_text=query_text,
                 doc_id=doc_id,
                 top_k=max(top_k, 5),
                 candidate_k=candidate_k,
-                reranker=reranker,
             )
         else:
             retrieved = eval_retrieve(
                 query_dense=query_dense,
                 query_sparse=query_sparse,
-                query_text=query_text,
                 doc_id=doc_id,
                 top_k=top_k,
                 candidate_k=candidate_k,
-                reranker=reranker,
             )
 
         retrieved_texts = [text for _, text in retrieved]
@@ -311,10 +354,11 @@ def run_e2e_eval(
             next((k for k in CUAD_CATEGORIES if k.lower() == question.lower()), question)
         )
 
-        extraction = extract_with_llm(clause_type, retrieved_texts, doc_id)
+        extraction = extract_with_llm(clause_type, retrieved_texts, doc_id, llm_cache)
 
         found        = bool(extraction.get("found", False))
-        clause_text  = extraction.get("clause_text") or ""
+        raw_text     = extraction.get("clause_text")
+        clause_text  = (trim_clause_text(raw_text) if apply_trim else raw_text) or ""
         confidence   = float(extraction.get("confidence", 0.0))
 
         if found:
@@ -356,6 +400,8 @@ def run_e2e_eval(
                 substring_hits  / max(answered, 1) * 100,
                 answered, skipped,
             )
+            if llm_cache is not None:
+                _save_llm_cache(llm_cache)
 
     # ── Aggregate metrics ─────────────────────────────────────────────────
     def _mean(lst: list[float]) -> float:
@@ -409,9 +455,9 @@ def run_e2e_eval(
         "eval_type":      "end_to_end_extraction",
         "model":          settings.embedding_model,
         "llm_extraction": settings.llm_extraction_model,
-        "reranker":       reranker_name or None,
         "enrich_queries": enrich_queries,
         "multi_query":    multi_query,
+        "apply_trim":     apply_trim,
         "top_k":          top_k,
         "candidate_k":    candidate_k,
         "dataset":        "chenghao/cuad_qa",
@@ -442,15 +488,17 @@ def main() -> None:
                         help="Map CUAD category labels to keyword-rich retrieval queries.")
     parser.add_argument("--multi-query", action="store_true",
                         help="Enable multi-query retrieval for hard categories (CUAD_ALT_QUERIES).")
-    parser.add_argument("--reranker", type=str, default="",
-                        help="Cross-encoder model for re-ranking. Example: BAAI/bge-reranker-v2-m3")
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON path. Default: auto-generated.")
+    parser.add_argument("--no-trim", action="store_true",
+                        help="Skip trim_clause_text() — use with cached responses to A/B test the trimmer.")
     parser.add_argument("--no-cleanup", action="store_true",
                         help="Keep cuad_eval Qdrant collection after the run.")
     parser.add_argument("--by-category", action="store_true",
                         help="Print per-category breakdown to stdout after the run.")
     args = parser.parse_args()
+
+    apply_trim = not args.no_trim
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     settings = get_settings()
@@ -461,35 +509,25 @@ def main() -> None:
         model_slug   = settings.embedding_model.split("/")[-1].lower().replace("-", "_")
         enrich_tag   = "_enriched" if args.enrich_queries else ""
         mq_tag       = "_mq"       if args.multi_query    else ""
-        reranker_tag = "_reranked" if args.reranker        else ""
         n_tag        = "_full"     if args.full           else f"_n{args.n}"
-        output_path  = RESULTS_DIR / f"e2e_{model_slug}_topk{args.top_k}{n_tag}{enrich_tag}{mq_tag}{reranker_tag}.json"
-
-    reranker = None
-    if args.reranker:
-        if not _HAVE_ST:
-            logger.error("--reranker requires sentence-transformers: pip install sentence-transformers")
-            sys.exit(1)
-        import torch
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        logger.info("[e2e] loading reranker %s on %s ...", args.reranker, device)
-        reranker = _CrossEncoder(args.reranker, device=device)
-        logger.info("[e2e] reranker ready")
+        trim_tag     = "_notrim"   if args.no_trim        else ""
+        output_path  = RESULTS_DIR / f"e2e_{model_slug}_topk{args.top_k}{n_tag}{enrich_tag}{mq_tag}{trim_tag}.json"
 
     rows       = load_cuad_test()
     sample_ids = list(range(len(rows))) if args.full else load_or_generate_sample_ids(rows, args.n)
 
+    llm_cache = _load_llm_cache()
     logger.info(
-        "[e2e] %d rows | embed=%s | llm=%s | top_k=%d | enrich=%s | mq=%s | reranker=%s",
+        "[e2e] %d rows | embed=%s | llm=%s | top_k=%d | enrich=%s | mq=%s | llm_cache=%d entries",
         len(sample_ids), settings.embedding_model, settings.llm_extraction_model,
-        args.top_k, args.enrich_queries, args.multi_query, args.reranker or "(none)",
+        args.top_k, args.enrich_queries, args.multi_query, len(llm_cache),
     )
 
     setup_eval_collection()
 
     try:
-        doc_chunks_map   = index_eval_rows(rows, sample_ids)
-        query_embeddings = embed_questions(
+        index_eval_rows(rows, sample_ids)
+        query_embeddings, _ = embed_questions(
             rows, sample_ids,
             enrich_queries=args.enrich_queries,
         )
@@ -501,8 +539,8 @@ def main() -> None:
             candidate_k=args.candidate_k,
             enrich_queries=args.enrich_queries,
             multi_query=args.multi_query,
-            reranker=reranker,
-            reranker_name=args.reranker,
+            llm_cache=llm_cache,
+            apply_trim=apply_trim,
         )
         elapsed = time.perf_counter() - t0
 
@@ -514,10 +552,10 @@ def main() -> None:
         print(f"  End-to-End Extraction Eval")
         print(f"  Embed model : {results['model']}")
         print(f"  LLM         : {results['llm_extraction']}")
-        print(f"  Reranker    : {results['reranker'] or '(none)'}")
         print(f"  Top-K       : {results['top_k']}  (candidate_k={results['candidate_k']})")
         print(f"  Enrich      : {'yes' if results['enrich_queries'] else 'no'}")
         print(f"  Multi-query : {'yes' if results['multi_query'] else 'no'}")
+        print(f"  Trim        : {'yes' if results['apply_trim'] else 'no (--no-trim)'}")
         print(f"  Sample      : {m['answered_rows']} rows ({m['skipped_no_answer']} skipped)")
         print("=" * 64)
         print(f"  Retrieval Recall@3 : {m['retrieval_recall_at_3']:.1%}  (sanity check vs cuad_eval)")
@@ -548,6 +586,8 @@ def main() -> None:
             print()
 
     finally:
+        _save_llm_cache(llm_cache)
+        logger.info("[cache] llm cache saved — %d entries", len(llm_cache))
         if not args.no_cleanup:
             teardown_eval_collection()
 

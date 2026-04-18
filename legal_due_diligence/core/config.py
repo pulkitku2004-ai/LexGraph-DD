@@ -237,6 +237,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    # Static Bearer token for API authentication.
+    # Empty string (default) = auth disabled — safe for local dev.
+    # Set API_KEY=<secret> in .env to enable. All endpoints require
+    # Authorization: Bearer <key>. The Streamlit UI reads the same var.
+    api_key: str = Field(
+        default="",
+        description="Bearer token for API auth. Empty = disabled (local dev).",
+    )
+
     # ── Application ──────────────────────────────────────────────────────────
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8000)

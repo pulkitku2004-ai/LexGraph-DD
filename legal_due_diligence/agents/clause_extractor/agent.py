@@ -62,6 +62,7 @@ from agents.clause_extractor.prompts import (
     CUAD_CATEGORIES,
     SYSTEM_PROMPT,
     build_extraction_prompt,
+    trim_clause_text,
 )
 from agents.clause_extractor.retriever import retrieve, retrieve_multi
 from core.config import settings
@@ -157,7 +158,7 @@ def _parse_response(
             document_id=doc_id,
             clause_type=clause_type,
             found=bool(data.get("found", False)),
-            clause_text=data.get("clause_text"),
+            clause_text=trim_clause_text(data.get("clause_text")),
             normalized_value=data.get("normalized_value"),
             confidence=float(data.get("confidence", 0.0)),
             source_chunk_id=source_chunk_id,

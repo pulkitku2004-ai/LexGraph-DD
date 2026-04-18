@@ -39,7 +39,9 @@ Why catch all exceptions?
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Optional
 
 import litellm
@@ -48,10 +50,114 @@ from agents.contradiction_detector.cypher_queries import (
     find_absence_conflicts,
     find_value_conflicts,
 )
+from agents.risk_scorer.rules import MISSING_CLAUSE_RISK
 from core.config import settings
 from core.models import Contradiction
 from core.state import GraphState
 from infrastructure.neo4j_client import get_neo4j_session
+
+# Clause types where an absence conflict is meaningful.
+# Low-importance absences (e.g. "Source Code Escrow absent in doc B") are
+# extraction noise, not genuine contractual differences.
+_ABSENCE_CONFLICT_CATEGORIES: frozenset[str] = frozenset(
+    ct for ct, level in MISSING_CLAUSE_RISK.items() if level in ("high", "medium")
+)
+
+# ── Value normalization ────────────────────────────────────────────────────────
+# The Cypher query catches toLower/trim differences but not LLM extraction
+# variance. "thirty days" vs "30 days" is not a real conflict.
+
+_NUMBER_WORDS: dict[str, str] = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
+    "forty": "40", "fifty": "50", "sixty": "60", "ninety": "90",
+}
+
+_MULTIPLIERS: dict[str, int] = {
+    "hundred": 100,
+    "thousand": 1_000, "k": 1_000,
+    "million": 1_000_000, "m": 1_000_000,
+    "billion": 1_000_000_000, "bn": 1_000_000_000,
+}
+
+# Currency/unit words to strip before number parsing
+_CURRENCY_RE = re.compile(
+    r"[$£€¥]|"
+    r"\b(dollars?|usd|euros?|eur|pounds?|gbp|cents?)\b",
+    re.IGNORECASE,
+)
+# "1.5 million", "500k", "2bn" — digit(s) immediately followed by multiplier
+_NUM_MULT_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*(hundred|thousand|k|million|m|billion|bn)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_to_canonical_number(text: str) -> str | None:
+    """
+    Try to parse a monetary/numeric string to a canonical integer string.
+    Returns None if the text is not purely a number (e.g. "30 days" → None).
+
+    Handles:
+      "$1,000,000"           → "1000000"
+      "one million dollars"  → "1000000"  (after _NUMBER_WORDS substitution)
+      "$1.5 million"         → "1500000"
+      "500k"                 → "500000"
+      "1bn"                  → "1000000000"
+    """
+    t = _CURRENCY_RE.sub("", text).replace(",", "").strip()
+    if not t:
+        return None
+
+    # "X.Y multiplier" or "X multiplier"
+    m = _NUM_MULT_RE.fullmatch(t)
+    if m:
+        return str(int(float(m.group(1)) * _MULTIPLIERS[m.group(2).lower()]))
+
+    # Plain integer or float with no non-numeric suffix
+    try:
+        f = float(t)
+        # Reject if t still contains letters (e.g. "12 months" won't reach here,
+        # but guard against edge cases like "1e6" which we don't want to flatten)
+        if re.search(r"[a-zA-Z]", t):
+            return None
+        return str(int(f))
+    except ValueError:
+        return None
+
+
+def _normalize_for_comparison(value: str) -> str:
+    """
+    Reduce LLM extraction variance before conflict comparison.
+
+    Pass 1 — surface form cleanup:
+      - Parenthesized repetitions:  "thirty (30) days" → "thirty days"
+      - Number words → digits:      "thirty days" → "30 days"
+      - Jurisdiction wrappers:      "State of Delaware" → "Delaware"
+
+    Pass 2 — canonical number:
+      - After number-word substitution, attempt to parse the whole string
+        as a monetary/numeric value and return a canonical integer string.
+      - "$1,000,000" == "one million dollars" == "$1M" → "1000000"
+      - "30 days" is NOT a pure number (has "days") → unchanged
+    """
+    v = value.lower().strip()
+    v = re.sub(r"\(\d+\)", "", v)                  # drop "(30)" style repeats
+    for word, digit in _NUMBER_WORDS.items():
+        v = re.sub(rf"\b{word}\b", digit, v)
+    v = re.sub(r"^state of\s+", "", v)             # "State of X" → "X"
+    v = re.sub(r"\s+state$", "", v)                # "X State" → "X"
+    v = " ".join(v.split())
+
+    # Pass 2: try to collapse to canonical integer (currency/large numbers)
+    canonical = _parse_to_canonical_number(v)
+    if canonical is not None:
+        return canonical
+
+    return v
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +166,15 @@ litellm.suppress_debug_info = True
 # ── LLM explanation configuration ─────────────────────────────────────────────
 
 _EXPLANATION_SYSTEM_PROMPT = """You are a legal due diligence analyst reviewing contract portfolios.
-Your job is to explain the practical legal risk created when two contracts have conflicting provisions.
+Your job is to assess the risk level and explain the practical legal risk when two contracts have conflicting provisions.
 
 Rules:
-- Return ONLY plain text. No markdown, no bullet points, no headers.
-- One or two sentences maximum.
-- Focus on the practical consequence for a party involved with both contracts.
+- Return ONLY valid JSON. No markdown, no code blocks, no explanation outside the JSON.
+- "risk_level" must be "high", "medium", or "low":
+    high   — direct financial exposure, enforceability breakdown, or ownership dispute
+    medium — operational friction, asymmetric obligations, or compliance uncertainty
+    low    — administrative difference with minimal legal consequence
+- "explanation" must be one or two sentences: practical consequence for a party involved with both contracts.
 - Be specific: name the clause type and the conflicting values."""
 
 
@@ -80,17 +189,15 @@ def _build_explanation_prompt(
         f'These two contracts have a conflicting "{clause_type}" provision:\n'
         f"  - {doc_a}: {value_a}\n"
         f"  - {doc_b}: {value_b}\n\n"
-        f"Explain in one or two sentences the legal risk this conflict creates."
+        f'Return JSON with exactly these fields: {{"risk_level": "high"|"medium"|"low", "explanation": "..."}}'
     )
 
 
-def _call_explanation_llm(prompt: str) -> Optional[str]:
+def _call_explanation_llm(prompt: str) -> Optional[dict]:
     """
-    Call the reasoning model for a plain-language conflict explanation.
+    Call the reasoning model for a risk-assessed conflict explanation.
 
-    Uses settings.llm_reasoning_model (default: ollama/mistral-nemo).
-    temperature=0.0 — deterministic, auditable output.
-    max_tokens=150 — explanation is one or two sentences.
+    Returns parsed dict with 'risk_level' and 'explanation', or None on failure.
     """
     try:
         response = litellm.completion(
@@ -102,7 +209,10 @@ def _call_explanation_llm(prompt: str) -> Optional[str]:
             temperature=0.0,
             max_tokens=150,
         )
-        return response.choices[0].message.content.strip()
+        raw = (response.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
     except Exception as e:
         logger.error("[contradiction_detector] LLM explanation call failed: %s", e)
         return None
@@ -114,22 +224,29 @@ def _generate_explanation(
     value_a: str,
     doc_id_b: str,
     value_b: str,
-) -> str:
+) -> tuple[str, str]:
     """
-    Generate a plain-language explanation via LLM, falling back to a template.
+    Generate explanation + risk_level via LLM, falling back to a template.
 
-    The template fallback ensures every Contradiction object has a non-empty
-    explanation even when Ollama is unreachable or the LLM call fails.
+    Returns (explanation, risk_level). Template fallback defaults to "medium"
+    — conservative, ensures every Contradiction object is complete even when
+    Ollama is unreachable.
     """
     prompt = _build_explanation_prompt(clause_type, doc_id_a, value_a, doc_id_b, value_b)
     result = _call_explanation_llm(prompt)
     if result:
-        return result
-    # Template fallback — always produces a meaningful (if generic) explanation
+        risk_level = result.get("risk_level", "medium")
+        if risk_level not in ("high", "medium", "low"):
+            risk_level = "medium"
+        explanation = result.get("explanation", "").strip()
+        if explanation:
+            return explanation, risk_level
+
+    # Template fallback
     return (
         f"Conflicting {clause_type}: {doc_id_a} specifies '{value_a}' "
         f"while {doc_id_b} specifies '{value_b}'. Manual review recommended."
-    )
+    ), "medium"
 
 
 # ── Core detection logic ───────────────────────────────────────────────────────
@@ -165,10 +282,19 @@ def _build_contradictions(doc_ids: list[str]) -> list[Contradiction]:
         value_a = row["value_a"]
         value_b = row["value_b"]
 
-        explanation = _generate_explanation(clause_type, doc_id_a, value_a, doc_id_b, value_b)
+        # Fix 2: drop false positives from extraction variance
+        # ("thirty days" vs "30 days" is not a real conflict)
+        if _normalize_for_comparison(value_a) == _normalize_for_comparison(value_b):
+            logger.debug(
+                "[contradiction_detector] VALUE skipped (normalizes equal) | %s | %r vs %r",
+                clause_type, value_a, value_b,
+            )
+            continue
+
+        explanation, risk_level = _generate_explanation(clause_type, doc_id_a, value_a, doc_id_b, value_b)
         logger.info(
-            "[contradiction_detector] VALUE | %s | %s=%r vs %s=%r",
-            clause_type, doc_id_a, value_a, doc_id_b, value_b,
+            "[contradiction_detector] VALUE | %s | %s | %s=%r vs %s=%r",
+            risk_level.upper(), clause_type, doc_id_a, value_a, doc_id_b, value_b,
         )
         contradictions.append(
             Contradiction(
@@ -178,12 +304,21 @@ def _build_contradictions(doc_ids: list[str]) -> list[Contradiction]:
                 value_a=value_a,
                 value_b=value_b,
                 explanation=explanation,
+                risk_level=risk_level,
             )
         )
 
     # ── Absence conflicts ──────────────────────────────────────────────────────
     for row in absence_rows:
         clause_type = row["clause_type"]
+
+        # Fix 1: skip low-importance absences — extraction noise dominates there
+        if clause_type not in _ABSENCE_CONFLICT_CATEGORIES:
+            logger.debug(
+                "[contradiction_detector] ABSENCE skipped (low importance) | %s", clause_type
+            )
+            continue
+
         doc_id_a = row["doc_id_a"]
         doc_id_b = row["doc_id_b"]
         found_a: bool = row["found_a"]
@@ -197,10 +332,10 @@ def _build_contradictions(doc_ids: list[str]) -> list[Contradiction]:
             value_a = "(clause absent)"
             value_b = raw_b or "(present, value not extracted)"
 
-        explanation = _generate_explanation(clause_type, doc_id_a, value_a, doc_id_b, value_b)
+        explanation, risk_level = _generate_explanation(clause_type, doc_id_a, value_a, doc_id_b, value_b)
         logger.info(
-            "[contradiction_detector] ABSENCE | %s | %s=%r vs %s=%r",
-            clause_type, doc_id_a, value_a, doc_id_b, value_b,
+            "[contradiction_detector] ABSENCE | %s | %s | %s=%r vs %s=%r",
+            risk_level.upper(), clause_type, doc_id_a, value_a, doc_id_b, value_b,
         )
         contradictions.append(
             Contradiction(
@@ -210,6 +345,7 @@ def _build_contradictions(doc_ids: list[str]) -> list[Contradiction]:
                 value_a=value_a,
                 value_b=value_b,
                 explanation=explanation,
+                risk_level=risk_level,
             )
         )
 

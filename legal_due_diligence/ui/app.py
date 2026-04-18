@@ -20,6 +20,7 @@ Start the API first, then run this app:
 
 from __future__ import annotations
 
+import os
 import time
 
 import requests
@@ -47,6 +48,13 @@ for key, default in {
 with st.sidebar:
     st.title("⚖️ Legal DD Engine")
     api_url = st.text_input("API URL", value="http://localhost:8000", key="api_url")
+    api_key = st.text_input(
+        "API Key",
+        value=os.environ.get("API_KEY", ""),
+        type="password",
+        key="api_key",
+        help="Leave empty if the server has no API_KEY configured.",
+    )
 
     if st.session_state.job_id:
         st.divider()
@@ -61,7 +69,7 @@ with st.sidebar:
         st.divider()
         if st.button("🗑️ Delete job & clear data", type="secondary", use_container_width=True):
             try:
-                r = requests.delete(f"{api_url}/jobs/{st.session_state.job_id}", timeout=10)
+                r = requests.delete(f"{api_url}/jobs/{st.session_state.job_id}", headers=_headers(), timeout=10)
                 if r.status_code in (204, 404):
                     for key in ("job_id", "job_status", "report", "doc_ids", "errors"):
                         st.session_state[key] = None if key in ("job_id", "job_status", "report") else []
@@ -74,10 +82,17 @@ with st.sidebar:
                 st.error("Cannot reach API. Is the server running?")
 
 
+# ── Auth header ───────────────────────────────────────────────────────────────
+def _headers() -> dict[str, str]:
+    """Return Authorization header if an API key is configured."""
+    key = st.session_state.get("api_key", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 # ── Helper: poll job status ────────────────────────────────────────────────────
 def _poll(job_id: str) -> dict | None:
     try:
-        r = requests.get(f"{api_url}/jobs/{job_id}", timeout=10)
+        r = requests.get(f"{api_url}/jobs/{job_id}", headers=_headers(), timeout=10)
         if r.status_code == 200:
             return r.json()
     except requests.exceptions.ConnectionError:
@@ -114,7 +129,7 @@ if st.session_state.job_id is None:
         files = [("files", (f.name, f.read(), f.type or "application/octet-stream")) for f in uploaded]
         try:
             with st.spinner("Submitting job…"):
-                r = requests.post(f"{api_url}/jobs", files=files, timeout=30)
+                r = requests.post(f"{api_url}/jobs", files=files, headers=_headers(), timeout=30)
             if r.status_code == 202:
                 data = r.json()
                 st.session_state.job_id = data["job_id"]
@@ -208,6 +223,7 @@ elif st.session_state.job_status == "done":
                     r = requests.post(
                         f"{api_url}/jobs/{st.session_state.job_id}/qa",
                         json={"question": question},
+                        headers=_headers(),
                         timeout=60,
                     )
                 if r.status_code == 200:
