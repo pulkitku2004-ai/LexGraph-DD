@@ -1,7 +1,9 @@
 # LexGraph-DD — Master Context
 
-**Last updated:** 2026-04-19
+**Last updated:** 2026-04-20
 **Status:** PROJECT CLOSED. Sprint 23 complete. Sprint 24 (JOB_STORE SQLite persistence) was in scope but project was called off after final extraction quality evaluation confirmed a model capability ceiling — not addressable without a better extraction model or contrastive fine-tuning. All retrieval and extraction improvement avenues exhausted. System is production-ready for a prototype; limitations documented below and in README.
+
+**Post-close cleanup (2026-04-20):** Low-risk code quality pass — dead field removal (`chunk_overlap`, `reranker_model`), `litellm.suppress_debug_info` centralized to `core/config.py`, duplicate JSON fence-stripping extracted to `core/utils.strip_json_fence()`, `Optional[X]` modernized to `X | None` throughout.
 
 ---
 
@@ -185,7 +187,8 @@ legal_dd/
 │   │   └── embeddings_bge_m3_p2048_c256_o51.pkl   ← 5,199 entries, ~50 min → ~2 min repeat
 │   └── results/
 └── legal_due_diligence/
-    ├── core/config.py, models.py, state.py
+    ├── core/config.py, models.py, state.py, utils.py
+    │         └── utils.py  ← strip_json_fence() shared by clause_extractor, risk_scorer, report_qa
     ├── infrastructure/qdrant_client.py, neo4j_client.py, health_check.py
     ├── ingestion/loader.py, chunker.py, embedder.py, indexer.py
     ├── agents/
@@ -204,29 +207,59 @@ legal_dd/
 ## Core Data Models (`core/models.py`, `core/state.py`)
 
 ```python
-DocumentRecord:     doc_id, file_path, processed, page_count
+# core/models.py — Pydantic BaseModel, Python 3.12 union syntax throughout
 
-ExtractedClause:    document_id, clause_type, found: bool,
-                    clause_text, normalized_value, confidence,
-                    source_chunk_id  # UUID → Qdrant → page → PDF
+class DocumentRecord(BaseModel):
+    doc_id: str
+    file_path: str
+    processed: bool = False
+    page_count: int | None = None        # set after successful load
 
-RiskFlag:           document_id, clause_type, risk_level (high/med/low),
-                    reason, is_missing_clause, source_clause_id
+class ExtractedClause(BaseModel):
+    document_id: str
+    clause_type: str                     # one of CUAD's 41 categories
+    found: bool                          # False = missing clause = risk signal
+    clause_text: str | None = None       # verbatim extracted text
+    normalized_value: str | None = None  # e.g. "Delaware", "30 days", "$1M"
+    confidence: float                    # 0.0–1.0
+    source_chunk_id: str                 # child_chunk_id → Qdrant → page → PDF
 
-Contradiction:      clause_type, document_id_a, document_id_b,
-                    value_a, value_b, explanation
+class RiskFlag(BaseModel):
+    document_id: str
+    clause_type: str
+    risk_level: Literal["high", "medium", "low"]
+    reason: str
+    is_missing_clause: bool              # distinguishes missing vs. bad content
+    source_clause_id: str | None = None  # ExtractedClause.source_chunk_id → page citation
 
-GraphState:         job_id, status, created_at,
-                    documents: list[DocumentRecord],
-                    extracted_clauses: list[ExtractedClause],
-                    risk_flags: list[RiskFlag],
-                    contradictions: list[Contradiction],
-                    neo4j_ready, qdrant_ready, graph_built: bool,
-                    final_report: str | None,
-                    errors: list[str]
+class Contradiction(BaseModel):
+    clause_type: str
+    document_id_a: str
+    document_id_b: str
+    value_a: str
+    value_b: str
+    explanation: str                     # LLM-generated plain-English risk explanation
+    risk_level: Literal["high", "medium", "low"] = "medium"
+
+# core/state.py — the single object that flows through the LangGraph machine
+class GraphState(BaseModel):
+    job_id: str
+    status: str = "pending"
+    created_at: datetime
+    documents: list[DocumentRecord] = []
+    extracted_clauses: list[ExtractedClause] = []
+    risk_flags: list[RiskFlag] = []
+    contradictions: list[Contradiction] = []
+    neo4j_ready: bool = False
+    qdrant_ready: bool = False
+    graph_built: bool = False            # True after entity_mapper writes to Neo4j
+    final_report: str | None = None
+    errors: list[str] = []
 ```
 
 **Critical:** LangGraph nodes return `dict` (not GraphState). Return only changed fields.
+
+**Utility:** `core/utils.py` — `strip_json_fence(text: str) -> str` strips ` ```...``` ` wrappers from LLM responses before `json.loads()`. Used by clause_extractor, risk_scorer, and report_qa parsers.
 
 ---
 
@@ -244,52 +277,145 @@ START → health_check
 
 ---
 
-## System DFD (Sprint 19 — Production State)
-
-### Production Ingestion + Agent Pipeline
+## System DFD (Level 1 — Production)
 
 ```mermaid
 graph TD
-    A["Raw PDF / DOCX / TXT"] --> B["Loader\nPyMuPDF / python-docx\npage-level text extraction"]
-    B --> C["Chunker\n_merge_headings ≤80-char paragraphs\n2048-tok contiguous parents\n256-tok children, 51-tok overlap\ntoken-ID level, no drift"]
-    C --> D["Embedder — BAAI/bge-m3\nMPS fp16, batch=24\ndense: CLS-pool L2-norm → 1024-dim\nsparse: sparse_linear head on CPU"]
-    D --> E["Indexer — Qdrant Upsert\npoint id = child_chunk_id\nvectors: {dense, sparse}\npayload: {text, parent_text, parent_id,\nparent_chunk_index, doc_id, page_number}"]
+    %% ── External entities ──────────────────────────────────────────────────────
+    CLIENT(["`**API Client**
+    browser / curl / Streamlit`"])
+    LLM(["`**LLM Providers**
+    Groq · Ollama · OpenRouter`"])
 
-    E --> F["LangGraph: health_check\nQdrant + Neo4j reachability\nwrites qdrant_ready, neo4j_ready flags"]
-    F -- "qdrant_ready=True" --> G["Clause Extractor\n41 categories × per doc\ndense top-20 + sparse top-20 → RRF k=60\nStage 1: score-order parent_id dedup\nStage 2: doc-order by parent_chunk_index\n15 hard categories: 2-3 alt queries, RRF summed\nasyncio.gather + Semaphore(10)"]
-    F -- "qdrant_ready=False" --> K
+    %% ── Data stores ────────────────────────────────────────────────────────────
+    FS[("`**Temp FS**
+    /tmp/legal_dd_{job}/
+    raw PDF·DOCX·TXT`")]
 
-    G --> H["Risk Scorer\nrules pass: O(1) deterministic flags\nLLM pass: 8 nuanced categories only"]
-    H -- "neo4j_ready=True" --> I["Entity Mapper\nNeo4j MERGE: Party, Jurisdiction,\nDuration, MonetaryAmount\ngraph_built=True"]
-    H -- "neo4j_ready=False" --> J
-    I --> J["Contradiction Detector\nCypher scoped to job doc_ids\nvalue conflicts + absence conflicts\nLLM plain-English explanations"]
-    J --> K["Report + Q&A\ndeterministic formatter first\none LLM call: executive summary\ntemplate fallback if LLM fails\nfinal_report always populated"]
-    K --> L["FastAPI Response\nGET /jobs/{id} → report\nPOST /jobs/{id}/qa → cited answer"]
+    QDRANT[("`**Qdrant**
+    collection: legal_clauses
+    dense 1024-dim + sparse SPLADE`")]
+
+    NEO4J[("`**Neo4j**
+    Document·Clause·Party
+    Jurisdiction·Duration·Amount`")]
+
+    JOBSTORE[("`**JOB_STORE**
+    in-memory dict
+    job_id → JobRecord`")]
+
+    %% ── Processes ──────────────────────────────────────────────────────────────
+    P0["`**0 · Ingestion**
+    loader → chunker → embedder → indexer`"]
+
+    P1["`**1 · Health Check**
+    ping Qdrant + Neo4j`"]
+
+    P2["`**2 · Clause Extractor**
+    41 cats × N docs · async · Semaphore(10)`"]
+
+    P3["`**3 · Risk Scorer**
+    rules pass + LLM pass (8 cats)`"]
+
+    P4["`**4 · Entity Mapper**
+    MERGE nodes + relationships`"]
+
+    P5["`**5 · Contradiction Detector**
+    Cypher value + absence queries`"]
+
+    P6["`**6 · Report + Q&A**
+    deterministic formatter + LLM narrative`"]
+
+    %% ── Data flows ─────────────────────────────────────────────────────────────
+
+    CLIENT -->|"multipart file bytes"| FS
+    FS -->|"file path + doc_id"| P0
+    P0 -->|"EmbeddedChunk[]\n{child_vec[1024], sparse_vec,\nparent_text, page_number, doc_id}"| QDRANT
+
+    P1 -->|"HTTP GET /healthz"| QDRANT
+    P1 -->|"Bolt PING"| NEO4J
+    P1 -->|"qdrant_ready: bool\nneo4j_ready: bool"| P2
+
+    QDRANT -->|"RetrievedChunk[]\n{text, parent_text,\nrrf_score, page_number,\nchunk_id, doc_id}"| P2
+    P2 <-->|"extraction prompt →\n← JSON {found, clause_text,\nnormalized_value, confidence}"| LLM
+    P2 -->|"ExtractedClause[]\n41 × N objects"| P3
+
+    P3 <-->|"nuance prompt (8 cats) →\n← JSON {flag, risk_level, reason}"| LLM
+    P3 -->|"RiskFlag[]"| P4
+
+    P4 -->|"MERGE Document, Clause,\nParty, Jurisdiction,\nDuration, MonetaryAmount"| NEO4J
+    P4 -->|"graph_built: bool"| P5
+
+    NEO4J -->|"value_conflict rows\n{clause_type, doc_id_a/b,\nvalue_a/b}"| P5
+    NEO4J -->|"absence_conflict rows\n{clause_type, found_a,\nvalue_a/b}"| P5
+    P5 <-->|"explanation prompt →\n← JSON {risk_level, explanation}"| LLM
+    P5 -->|"Contradiction[]"| P6
+
+    P6 <-->|"narrative prompt →\n← JSON {executive_summary,\nrecommended_actions}"| LLM
+    P6 -->|"final_report: str (Markdown)"| JOBSTORE
+
+    JOBSTORE -->|"JobRecord\n{status, report, errors}"| CLIENT
+    CLIENT -->|"POST /jobs/{id}/qa\n{question: str}"| P6
+    QDRANT -->|"RetrievedChunk[] (cross-doc\nscoped to job doc_ids)"| P6
+    P6 -->|"answer + citations[]"| CLIENT
 ```
 
-> **Scope note:** No caching occurs in the production path. Every ingestion run embeds fresh via GPU.
+> **Scope:** Production path only. No caching — every ingestion embeds fresh via GPU.
+> **Neo4j bypass:** If `neo4j_ready=False`, P4 is skipped; P5 returns `[]` immediately; report notes the skip.
+> **Qdrant bypass:** If `qdrant_ready=False`, P2/P3/P4/P5 all skipped; P6 generates report from empty state.
 
 ---
 
-### Eval Harness DFD (Sprint 19 — with Embedding Cache)
-
-The embedding cache is eval-only — it does not touch the production indexer or any agent code.
+### Eval Harness DFD (with Embedding Cache)
 
 ```mermaid
 graph TD
-    A["CUAD Test Rows\nchenghao/cuad_qa\n360-row sample, fixed sample_ids.json"] --> B["Load & chunk eval contracts\nsame Chunker config as production\n256-child / 2048-parent"]
-    B --> C{"Cache check\neval/cache/embeddings_{slug}.pkl\nkey: MD5(child_text)\nslug: model + chunk params"}
-    C -- "Hit (warm run)" --> D["Load tensors from disk\n5,199 entries, ~1s\nGPU skipped entirely"]
-    C -- "Miss (cold run)" --> E["Embedder: BGE-M3 GPU pass\n~8s/row × 360 rows ≈ 50 min cold\nbatch=24, MPS fp16"]
-    E --> F["Save to disk cache\nauto-invalidates on model\nor chunk config change"]
-    D & F --> G["Qdrant: ephemeral upsert\nper-eval, scoped to eval doc_ids"]
-    G --> H["embed_questions\nprimary queries batched\nalt queries for 15 hard categories\npre-batched upfront, not per-row"]
-    H --> I["Recall@K eval loop\nenrich-queries + multi-query RRF\nhit_at_1, hit_at_3 per row"]
-    I --> J["Results JSON\neval/results/{name}.json\nmetrics + per_row breakdown"]
-    J --> K["analyze_categories.py\nper-category R@3, worst-first sort"]
+    CUAD(["`**CUAD Dataset**
+    chenghao/cuad_qa
+    1,244 test rows`"])
+
+    CACHE[("`**Embedding Cache**
+    eval/cache/embeddings_{slug}.pkl
+    key: MD5(child_text)`")]
+
+    QDRANT2[("`**Qdrant**
+    ephemeral per-eval run
+    scoped to eval doc_ids`")]
+
+    E0["`**Load + Chunk**
+    same Chunker config as prod
+    256-child / 2048-parent`"]
+    E1["`**Cache Check**
+    slug = model + chunk params
+    auto-invalidates on config change`"]
+    E2["`**BGE-M3 GPU Pass**
+    MPS fp16 · batch=24
+    ~8s/row cold`"]
+    E3["`**Embed Questions**
+    primary + alt queries (15 hard cats)
+    batched upfront — not per-row`"]
+    E4["`**Recall@K Loop**
+    enrich-queries + multi-query RRF
+    hit@1, hit@3 per row`"]
+    E5["`**Results JSON**
+    eval/results/{name}.json`"]
+    E6["`**analyze_categories.py**
+    per-category R@3
+    worst-first sort`"]
+
+    CUAD --> E0
+    E0 -->|"child chunks"| E1
+    E1 -->|"cache miss\nuncached texts"| E2
+    E2 -->|"dense+sparse tensors"| CACHE
+    E1 -->|"cache hit\n~1s warm load"| QDRANT2
+    CACHE -->|"tensors from disk"| QDRANT2
+    QDRANT2 --> E3
+    E3 --> E4
+    E4 -->|"per-row results"| E5
+    E5 --> E6
 ```
 
-> **Speedup:** Cold run (cache miss, 360 rows) ≈ 50 min. Warm run (cache hit) ≈ 2 min total (30×). Question embedding always runs (~22s for 360 questions) — question cache not implemented.
+> **Speedup:** Cold run ≈ 50 min. Warm run (cache hit) ≈ 2 min (30×). Question embeddings not cached — always re-embeds (~22s for 360 questions).
 
 ---
 
@@ -372,6 +498,90 @@ LLM explanation per conflict (template fallback on failure). Returns `list[Contr
 
 ---
 
+## Agent Contracts
+
+Structured I/O contracts for every node in the LangGraph state machine. All nodes receive the full `GraphState` and return a `dict` of changed fields only.
+
+---
+
+### 1. Health Check (`infrastructure/health_check.py`)
+
+| | |
+|---|---|
+| **Reads** | `state.errors` (copied, not mutated) |
+| **Writes** | `qdrant_ready: bool`, `neo4j_ready: bool`, `status: "infrastructure_checked"`, `errors: list[str]` |
+| **Contract downstream** | Both booleans read exclusively by the orchestrator routing functions — never by downstream agents. `qdrant_ready` gates `route_after_health`; `neo4j_ready` gates `route_after_risk`. |
+| **Transition from** | `START` (always first node) |
+| **Transition to** | `clause_extractor` if `qdrant_ready=True`; `report_qa` if `qdrant_ready=False` |
+| **If failure** | HTTP ping to Qdrant raises → `qdrant_ready=False`, error appended. Bolt ping to Neo4j raises → `neo4j_ready=False`, error appended. Never raises — always returns a complete dict so the graph can route gracefully. |
+
+---
+
+### 2. Clause Extractor (`agents/clause_extractor/agent.py`)
+
+| | |
+|---|---|
+| **Reads** | `state.documents` (for `doc_id` list + `processed` flag), `state.extracted_clauses` (to extend), `state.qdrant_ready` (guard) |
+| **Writes** | `extracted_clauses: list[ExtractedClause]`, `status: "clauses_extracted"`, `errors: list[str]` |
+| **Contract downstream** | `ExtractedClause[]` — one object per `(doc_id × clause_type)` pair. Risk Scorer reads `found`, `confidence`, `clause_text`, `clause_type`, `document_id`. Entity Mapper reads all fields. Format: `ExtractedClause(document_id, clause_type, found: bool, clause_text: str\|None, normalized_value: str\|None, confidence: float, source_chunk_id: str)` |
+| **Transition from** | `health_check` (only when `qdrant_ready=True`) |
+| **Transition to** | `risk_scorer` (unconditional) |
+| **If failure** | Per-`(doc, category)` exception → `_missing_clause()` returned (found=False, confidence=0.0) — conservative, over-flags risk rather than silently dropping. LLM total failure across all providers → all 41 categories for that doc return found=False. `qdrant_ready=False` guard at node entry → returns immediately with error. One bad doc never aborts others. |
+
+---
+
+### 3. Risk Scorer (`agents/risk_scorer/agent.py`)
+
+| | |
+|---|---|
+| **Reads** | `state.extracted_clauses` |
+| **Writes** | `risk_flags: list[RiskFlag]`, `status: "risks_scored"` |
+| **Contract downstream** | `RiskFlag[]` — Report+Q&A reads `risk_level`, `reason`, `is_missing_clause`, `clause_type`, `document_id`, `source_clause_id`. Format: `RiskFlag(document_id, clause_type, risk_level: "high"\|"medium"\|"low", reason: str, is_missing_clause: bool, source_clause_id: str\|None)` |
+| **Transition from** | `clause_extractor` (unconditional) |
+| **Transition to** | `entity_mapper` if `neo4j_ready=True`; `contradiction_detector` if `neo4j_ready=False` |
+| **If failure** | Per-clause exception → logged, that clause skipped entirely (no flag emitted — conservative). LLM call failure for nuanced categories → LLM flag skipped; deterministic rule flags from Pass 1 still stand. Low-confidence clauses (`confidence < 0.4`) skip LLM pass — unreliable clause_text would produce unreliable risk assessment. |
+
+---
+
+### 4. Entity Mapper (`agents/entity_mapper/agent.py`)
+
+| | |
+|---|---|
+| **Reads** | `state.extracted_clauses`, `state.neo4j_ready`, `state.errors` |
+| **Writes** | `graph_built: bool`, `status: "graph_built"`, `errors: list[str]`; **side-effect:** Neo4j MERGE of Document, Clause, Party, Jurisdiction, Duration, MonetaryAmount nodes |
+| **Contract downstream** | Neo4j graph consumed by Contradiction Detector via two Cypher queries. Schema: `(:Document {doc_id})-[:HAS_CLAUSE]->(:Clause {doc_id, clause_type, normalized_value, confidence, found, source_chunk_id})-[:INVOLVES]->(:Party {name})` etc. All writes are `MERGE` (idempotent — safe to re-run). Writes both `found=True` AND `found=False` clauses — Contradiction Detector needs the absence records. |
+| **Transition from** | `risk_scorer` (only when `neo4j_ready=True`) |
+| **Transition to** | `contradiction_detector` (unconditional) |
+| **If failure** | Per-clause write exception → logged, appended to errors, loop continues (partial graph is still useful — Contradiction Detector works on whatever nodes exist). Neo4j session failure (hard stop) → `graph_built=False`, errors updated; Contradiction Detector checks `graph_built` and returns `[]` immediately. |
+
+---
+
+### 5. Contradiction Detector (`agents/contradiction_detector/agent.py`)
+
+| | |
+|---|---|
+| **Reads** | `state.graph_built` (guard), `state.documents` (for `doc_ids` scope), `state.errors`; queries Neo4j directly via two Cypher queries |
+| **Writes** | `contradictions: list[Contradiction]`, `status: "contradictions_detected"`, `errors: list[str]` |
+| **Contract downstream** | `Contradiction[]` — Report+Q&A builds contradiction table. Format: `Contradiction(clause_type, document_id_a, document_id_b, value_a: str, value_b: str, explanation: str, risk_level: "high"\|"medium"\|"low")`. All Cypher queries are scoped to `$doc_ids` — graph accumulates across jobs but detection never leaks cross-job. |
+| **Transition from** | `entity_mapper` (neo4j path) **or** `risk_scorer` (shortcut when `neo4j_ready=False`) |
+| **Transition to** | `report_qa` (unconditional) |
+| **If failure** | `graph_built=False` → returns `{"contradictions": [], "status": ...}` immediately (no Neo4j call attempted). Neo4j query exception → logged, appended to errors, returns empty list. LLM explanation failure per conflict → `_template_narrative`-style template fallback used; `Contradiction` object always emitted with explanation string. Value normalization (`_normalize_for_comparison`) collapses false positives ("thirty days" vs "30 days") before any LLM call. |
+
+---
+
+### 6. Report + Q&A (`agents/report_qa/agent.py`, `agents/report_qa/qa.py`)
+
+| | |
+|---|---|
+| **Reads** | Full `GraphState`: `extracted_clauses`, `risk_flags`, `contradictions`, `documents`, `errors`, `job_id` |
+| **Writes** | `final_report: str`, `status: "complete"`, `errors: list[str]`; **side-effect (runner):** `JOB_STORE[job_id].report` set by `api/runner.py` from `result["final_report"]` |
+| **Contract downstream** | `final_report` is a Markdown string — returned verbatim via `GET /jobs/{id}` in `JobResponse.report`. Q&A endpoint (`POST /jobs/{id}/qa`) returns `{answer: str, citations: [{doc_id, page_number, chunk_id, excerpt}], chunks_retrieved: int}`. |
+| **Transition from** | `contradiction_detector` (normal path) **or** `health_check` (fast-fail when `qdrant_ready=False`) |
+| **Transition to** | `END` |
+| **If failure** | Deterministic formatter (`formatter.py`) cannot fail — pure Python on state data. LLM narrative call fails → `_template_narrative(state)` generates a factually accurate generic summary from state counts. Outer `try/except` in `report_qa_node` calls template fallback as last resort. `final_report` is **always** a non-None string — the pipeline never returns without a report. |
+
+---
+
 ## FastAPI
 
 | Endpoint | Behaviour |
@@ -401,15 +611,36 @@ LLM explanation per conflict (template fallback on failure). Returns `list[Contr
 
 ## Key Architectural Decisions (reference)
 
-- **LangGraph returns dict:** return only changed fields or state field overwrites
-- **Health check as node:** routes around infra failures gracefully
-- **errors accumulate:** one bad PDF shouldn't abort 49 others
-- **Full list replacement:** explicit dedup vs LangGraph blind append
-- **parent_id dedup Stage 1:** best child selects which parent; no duplicate parents to LLM
-- **doc-order Stage 2:** LLM gets Article 2 before Article 10 (legal cross-references)
-- **Cypher scoped to $doc_ids:** graph accumulates across jobs — unscoped returns cross-job contradictions
-- **Formatter-first report:** deterministic tables can't be LLM-corrupted
-- **temperature=0 everywhere:** deterministic extraction = reliable evals
+**Pipeline / LangGraph:**
+- **LangGraph nodes return `dict`:** only changed fields — returning the full GraphState would overwrite fields already set by prior nodes
+- **Health check as graph node:** routes around infra failures gracefully; partial results more useful than a stack trace
+- **Conditional routing after health and risk:** two infra flags (`qdrant_ready`, `neo4j_ready`) gate the two expensive external dependencies independently
+- **errors accumulate, never raise:** one bad PDF must not abort 49 others; pipeline always terminates at report_qa with whatever it has
+
+**Retrieval:**
+- **Full list replacement in state:** explicit dedup vs LangGraph's blind append reducer — agents return updated full lists
+- **parent_id dedup Stage 1 (score order):** best child per parent selected by RRF score before passing to LLM
+- **doc-order Stage 2 (parent_chunk_index):** LLM gets Article 2 before Article 10 — legal clauses cross-reference earlier sections
+- **Equal-weight RRF (α=0.5):** bge-m3 dense and sparse vectors are jointly trained; tilting toward sparse overweights exact-match and loses semantic clustering (benchmarked — all alpha variants worse)
+- **Multi-query only for 15 hard categories:** alt queries for easy categories contaminate adjacent ones (Change of Control alt caused −23pp Anti-Assignment regression)
+
+**Graph / Contradiction:**
+- **Cypher scoped to `$doc_ids`:** Neo4j graph accumulates across jobs — unscoped query returns cross-job contradictions
+- **Entity Mapper writes found=False clauses too:** Contradiction Detector distinguishes value conflicts (both found, different values) from absence conflicts (one found, one missing)
+
+**Report:**
+- **Formatter-first:** deterministic risk table and contradiction table are built in pure Python before any LLM call — tables cannot be hallucinated or truncated
+- **`final_report` always populated:** three-layer fallback — LLM narrative → `_template_narrative()` → outer except; report_qa_node never returns None
+
+**LLM:**
+- **temperature=0 everywhere except Q&A (0.1):** deterministic extraction = reproducible evals; slight randomness in Q&A for prose fluency
+- **LiteLLM fallback chain handles rate limits:** no custom retry logic in agent code; Groq primary → Groq scout → Ollama local
+
+**Code quality (post-close cleanup 2026-04-20):**
+- **`litellm.suppress_debug_info = True` in `core/config.py`:** set once at import time, takes effect process-wide — not repeated per agent
+- **`core/utils.strip_json_fence()`:** shared across clause_extractor, risk_scorer, report_qa; was a copy-pasted 3-liner in three separate parse functions
+- **`X | None` over `Optional[X]`:** Python 3.10+ union syntax used consistently throughout codebase; `Optional` import removed from all modules
+- **`chunk_overlap` and `reranker_model` removed from config:** both were unused — `chunk_overlap` explicitly documented as unused since Sprint 16; `reranker_model` benchmarked and rejected Sprint 17 (−9.5pp), never wired to the retriever
 
 ---
 

@@ -53,7 +53,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
 
 import litellm
 
@@ -68,16 +67,14 @@ from agents.clause_extractor.retriever import retrieve, retrieve_multi
 from core.config import settings
 from core.models import ExtractedClause
 from core.state import GraphState
+from core.utils import strip_json_fence
 
 logger = logging.getLogger(__name__)
-
-# Suppress litellm's verbose request logging — we log at our own level
-litellm.suppress_debug_info = True
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
-def _call_llm(user_prompt: str) -> Optional[str]:
+def _call_llm(user_prompt: str) -> str | None:
     """
     Synchronous LLM call — kept for legacy callers and direct tests.
     Hot path uses _call_llm_async() instead.
@@ -100,7 +97,7 @@ def _call_llm(user_prompt: str) -> Optional[str]:
         return None
 
 
-async def _call_llm_async(user_prompt: str) -> Optional[str]:
+async def _call_llm_async(user_prompt: str) -> str | None:
     """
     Async LLM call via litellm.acompletion().
 
@@ -130,7 +127,7 @@ async def _call_llm_async(user_prompt: str) -> Optional[str]:
 # ── Response parsing (unchanged from Sprint 2) ────────────────────────────────
 
 def _parse_response(
-    raw: Optional[str],
+    raw: str | None,
     clause_type: str,
     doc_id: str,
     source_chunk_id: str,
@@ -138,22 +135,14 @@ def _parse_response(
     """
     Parse LLM JSON response into ExtractedClause.
     Returns a safe found=False clause on any parse failure.
-
-    Why strip markdown fences before parsing?
-    Some models (especially smaller ones) wrap JSON in ```json ... ```
-    even when instructed not to. Stripping fences makes the parser robust
-    without needing a separate prompt instruction for every model.
+    Fence stripping via core.utils.strip_json_fence handles models that
+    wrap JSON in ```json ... ``` despite instructions.
     """
     if raw is None:
         return _missing_clause(clause_type, doc_id, source_chunk_id)
 
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-
     try:
-        data = json.loads(text)
+        data = json.loads(strip_json_fence(raw))
         return ExtractedClause(
             document_id=doc_id,
             clause_type=clause_type,

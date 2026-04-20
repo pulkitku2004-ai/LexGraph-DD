@@ -42,7 +42,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
 
 import litellm
 
@@ -161,8 +160,6 @@ def _normalize_for_comparison(value: str) -> str:
 
 logger = logging.getLogger(__name__)
 
-litellm.suppress_debug_info = True
-
 # ── LLM explanation configuration ─────────────────────────────────────────────
 
 _EXPLANATION_SYSTEM_PROMPT = """You are a legal due diligence analyst reviewing contract portfolios.
@@ -193,7 +190,7 @@ def _build_explanation_prompt(
     )
 
 
-def _call_explanation_llm(prompt: str) -> Optional[dict]:
+def _call_explanation_llm(prompt: str) -> dict | None:
     """
     Call the reasoning model for a risk-assessed conflict explanation.
 
@@ -322,8 +319,8 @@ def _build_contradictions(doc_ids: list[str]) -> list[Contradiction]:
         doc_id_a = row["doc_id_a"]
         doc_id_b = row["doc_id_b"]
         found_a: bool = row["found_a"]
-        raw_a: Optional[str] = row.get("value_a")
-        raw_b: Optional[str] = row.get("value_b")
+        raw_a: str | None = row.get("value_a")
+        raw_b: str | None = row.get("value_b")
 
         if found_a:
             value_a = raw_a or "(present, value not extracted)"

@@ -21,7 +21,7 @@ Design decisions worth understanding:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -30,15 +30,15 @@ class DocumentRecord(BaseModel):
     doc_id: str
     file_path: str
     processed: bool = False
-    page_count: Optional[int] = None
+    page_count: int | None = None
 
 
 class ExtractedClause(BaseModel):
     document_id: str
     clause_type: str           # one of CUAD's 41 categories
     found: bool                # False = missing clause = risk signal
-    clause_text: Optional[str] = None
-    normalized_value: Optional[str] = None  # e.g. "Delaware", "30 days"
+    clause_text: str | None = None
+    normalized_value: str | None = None  # e.g. "Delaware", "30 days"
     confidence: float
     source_chunk_id: str       # for citation tracing back to Qdrant chunk
 
@@ -49,7 +49,7 @@ class RiskFlag(BaseModel):
     risk_level: Literal["high", "medium", "low"]
     reason: str
     is_missing_clause: bool
-    source_clause_id: Optional[str] = None  # ExtractedClause.source_chunk_id → Qdrant → page citation
+    source_clause_id: str | None = None  # ExtractedClause.source_chunk_id → Qdrant → page citation
 
 
 class Contradiction(BaseModel):

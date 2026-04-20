@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
 
 import litellm
 
@@ -52,10 +51,9 @@ from agents.report_qa.formatter import (
 )
 from core.config import settings
 from core.state import GraphState
+from core.utils import strip_json_fence
 
 logger = logging.getLogger(__name__)
-
-litellm.suppress_debug_info = True
 
 # ── LLM narrative generation ───────────────────────────────────────────────────
 
@@ -67,7 +65,7 @@ Return ONLY valid JSON with these exact keys:
 No markdown, no code blocks, no extra keys, no explanation outside the JSON object."""
 
 
-def _call_narrative_llm(prompt: str) -> Optional[str]:
+def _call_narrative_llm(prompt: str) -> str | None:
     """
     Call the reasoning model for executive summary + recommended actions.
     temperature=0.0 — deterministic, auditable.
@@ -89,7 +87,7 @@ def _call_narrative_llm(prompt: str) -> Optional[str]:
         return None
 
 
-def _parse_narrative(raw: Optional[str], state: GraphState) -> tuple[str, list[str]]:
+def _parse_narrative(raw: str | None, state: GraphState) -> tuple[str, list[str]]:
     """
     Parse LLM JSON into (executive_summary, recommended_actions).
     Falls back to template text on any failure so the report always assembles.
@@ -97,13 +95,8 @@ def _parse_narrative(raw: Optional[str], state: GraphState) -> tuple[str, list[s
     if raw is None:
         return _template_narrative(state)
 
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-
     try:
-        data = json.loads(text)
+        data = json.loads(strip_json_fence(raw))
         summary = str(data.get("executive_summary", "")).strip()
         actions = [str(a).strip() for a in data.get("recommended_actions", []) if a]
         if summary and actions:

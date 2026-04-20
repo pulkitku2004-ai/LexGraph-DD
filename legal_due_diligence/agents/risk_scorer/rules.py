@@ -28,7 +28,7 @@ legal significance.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from core.models import ExtractedClause, RiskFlag
 
@@ -120,7 +120,7 @@ PRESENCE_FLAGS: dict[str, tuple[Literal["high", "medium", "low"], str]] = {
 CONFIDENCE_THRESHOLD = 0.4
 
 
-def score_missing_clause(clause: ExtractedClause) -> Optional[RiskFlag]:
+def score_missing_clause(clause: ExtractedClause) -> RiskFlag | None:
     """
     Return a RiskFlag for an absent clause, or None if absence is low risk.
 
@@ -155,7 +155,7 @@ def score_missing_clause(clause: ExtractedClause) -> Optional[RiskFlag]:
     )
 
 
-def score_presence_flag(clause: ExtractedClause) -> Optional[RiskFlag]:
+def score_presence_flag(clause: ExtractedClause) -> RiskFlag | None:
     """
     Return a RiskFlag if the clause's presence is itself a risk indicator.
 
@@ -179,7 +179,7 @@ def score_presence_flag(clause: ExtractedClause) -> Optional[RiskFlag]:
     )
 
 
-def score_low_confidence(clause: ExtractedClause) -> Optional[RiskFlag]:
+def score_low_confidence(clause: ExtractedClause) -> RiskFlag | None:
     """
     Return a medium-risk flag if a found clause has suspiciously low confidence.
 

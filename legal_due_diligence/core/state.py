@@ -32,7 +32,6 @@ documents is negligible compared to the debugging clarity you gain.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -65,7 +64,7 @@ class GraphState(BaseModel):
     graph_built: bool = False  # True after entity_mapper writes to Neo4j
 
     # ── Terminal outputs ──────────────────────────────────────────────────
-    final_report: Optional[str] = None
+    final_report: str | None = None
 
     # ── Error accumulation ────────────────────────────────────────────────
     errors: list[str] = []

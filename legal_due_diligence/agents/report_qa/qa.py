@@ -29,7 +29,6 @@ RiskFlag.source_clause_id.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import litellm
 
@@ -37,8 +36,6 @@ from agents.clause_extractor.retriever import RetrievedChunk, retrieve
 from core.config import settings
 
 logger = logging.getLogger(__name__)
-
-litellm.suppress_debug_info = True
 
 _QA_SYSTEM_PROMPT = """You are a legal due diligence assistant answering questions about contracts.
 Answer based ONLY on the contract excerpts provided. Be precise and cite which document you are drawing from.
@@ -94,7 +91,7 @@ Question: {question}
 Answer based only on the excerpts above. Reference the document and page where relevant."""
 
 
-def _call_qa_llm(prompt: str) -> Optional[str]:
+def _call_qa_llm(prompt: str) -> str | None:
     """
     Call the reasoning model for Q&A.
     temperature=0.1 — slight randomness for prose fluency, still grounded.

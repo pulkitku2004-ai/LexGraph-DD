@@ -20,7 +20,6 @@ call fails, template fallback text keeps the report complete and correct.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
 from core.models import Contradiction, RiskFlag
 from core.state import GraphState

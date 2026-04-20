@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
 
 import litellm
 
@@ -54,10 +53,9 @@ from agents.risk_scorer.rules import (
 from core.config import settings
 from core.models import ExtractedClause, RiskFlag
 from core.state import GraphState
+from core.utils import strip_json_fence
 
 logger = logging.getLogger(__name__)
-
-litellm.suppress_debug_info = True
 
 # ── LLM assessment configuration ──────────────────────────────────────────────
 # Clause types that warrant LLM nuance assessment (found=True, conf >= threshold).
@@ -177,7 +175,7 @@ Return JSON with exactly these fields:
 }}"""
 
 
-def _call_reasoning_llm(prompt: str) -> Optional[str]:
+def _call_reasoning_llm(prompt: str) -> str | None:
     """
     Call the reasoning LLM for nuanced clause risk assessment.
 
@@ -203,9 +201,9 @@ def _call_reasoning_llm(prompt: str) -> Optional[str]:
 
 
 def _parse_llm_assessment(
-    raw: Optional[str],
+    raw: str | None,
     clause: ExtractedClause,
-) -> Optional[RiskFlag]:
+) -> RiskFlag | None:
     """
     Parse LLM JSON assessment into a RiskFlag, or None if no flag warranted.
 
@@ -215,13 +213,8 @@ def _parse_llm_assessment(
     if raw is None:
         return None
 
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-
     try:
-        data = json.loads(text)
+        data = json.loads(strip_json_fence(raw))
         if not data.get("flag", False):
             return None  # LLM found no risk — clause is standard
 

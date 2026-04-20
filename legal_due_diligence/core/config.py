@@ -160,24 +160,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ── Re-ranking ───────────────────────────────────────────────────────────
-    # Cross-encoder re-ranker applied after RRF fusion.
-    # Empty string = disabled (default — preserves current behaviour).
-    # Recommended: "BAAI/bge-reranker-base" (same ecosystem as bge-base embeddings).
-    # The reranker scores (query, chunk) pairs jointly, catching relevance that
-    # bi-encoder cosine similarity misses (e.g. category-label queries like
-    # "No-Solicit Of Employees" vs clause text that never uses those exact words).
-    # Cost: ~candidate_k cross-encoder calls per retrieval (fast on M4 MPS).
-    reranker_model: str = Field(
-        default="",
-        description=(
-            "Cross-encoder model for re-ranking RRF candidates. "
-            "Empty = disabled. "
-            "Recommended: 'BAAI/bge-reranker-base'. "
-            "Loaded lazily on first retrieval call."
-        ),
-    )
-
     # ── Chunking strategy ────────────────────────────────────────────────────
     # Parent-child chunking (Sprint 16 revision):
     #
@@ -202,13 +184,7 @@ class Settings(BaseSettings):
     #             ascending before passing to the LLM.
     #             Legal clauses reference prior sections; sending Article 10 before
     #             Article 2 breaks the LLM's understanding of legal hierarchy.
-    #
-    # chunk_overlap: 0 — parents are contiguous; field kept for backward compat.
     chunk_size: int = Field(default=2048)
-    chunk_overlap: int = Field(
-        default=0,
-        description="Unused post-Sprint-16 — parents are contiguous (no inter-parent overlap).",
-    )
     child_chunk_size: int = Field(
         default=256,
         description="Token size of child chunks embedded into Qdrant for retrieval.",
@@ -282,3 +258,8 @@ if settings.openrouter_api_key:
     os.environ.setdefault("OPENROUTER_API_KEY", settings.openrouter_api_key)
 if settings.groq_api_key:
     os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
+
+# Suppress litellm's verbose request/response logging globally.
+# Set once here so agent modules don't each repeat it.
+import litellm  # noqa: E402
+litellm.suppress_debug_info = True
