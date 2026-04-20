@@ -277,142 +277,175 @@ START → health_check
 
 ---
 
-## System DFD (Level 1 — Production)
+## System DFD — Ingestion Pipeline
 
-```mermaid
-graph TD
-    %% ── External entities ──────────────────────────────────────────────────────
-    CLIENT(["`**API Client**
-    browser / curl / Streamlit`"])
-    LLM(["`**LLM Providers**
-    Groq · Ollama · OpenRouter`"])
-
-    %% ── Data stores ────────────────────────────────────────────────────────────
-    FS[("`**Temp FS**
-    /tmp/legal_dd_{job}/
-    raw PDF·DOCX·TXT`")]
-
-    QDRANT[("`**Qdrant**
-    collection: legal_clauses
-    dense 1024-dim + sparse SPLADE`")]
-
-    NEO4J[("`**Neo4j**
-    Document·Clause·Party
-    Jurisdiction·Duration·Amount`")]
-
-    JOBSTORE[("`**JOB_STORE**
-    in-memory dict
-    job_id → JobRecord`")]
-
-    %% ── Processes ──────────────────────────────────────────────────────────────
-    P0["`**0 · Ingestion**
-    loader → chunker → embedder → indexer`"]
-
-    P1["`**1 · Health Check**
-    ping Qdrant + Neo4j`"]
-
-    P2["`**2 · Clause Extractor**
-    41 cats × N docs · async · Semaphore(10)`"]
-
-    P3["`**3 · Risk Scorer**
-    rules pass + LLM pass (8 cats)`"]
-
-    P4["`**4 · Entity Mapper**
-    MERGE nodes + relationships`"]
-
-    P5["`**5 · Contradiction Detector**
-    Cypher value + absence queries`"]
-
-    P6["`**6 · Report + Q&A**
-    deterministic formatter + LLM narrative`"]
-
-    %% ── Data flows ─────────────────────────────────────────────────────────────
-
-    CLIENT -->|"multipart file bytes"| FS
-    FS -->|"file path + doc_id"| P0
-    P0 -->|"EmbeddedChunk[]\n{child_vec[1024], sparse_vec,\nparent_text, page_number, doc_id}"| QDRANT
-
-    P1 -->|"HTTP GET /healthz"| QDRANT
-    P1 -->|"Bolt PING"| NEO4J
-    P1 -->|"qdrant_ready: bool\nneo4j_ready: bool"| P2
-
-    QDRANT -->|"RetrievedChunk[]\n{text, parent_text,\nrrf_score, page_number,\nchunk_id, doc_id}"| P2
-    P2 <-->|"extraction prompt →\n← JSON {found, clause_text,\nnormalized_value, confidence}"| LLM
-    P2 -->|"ExtractedClause[]\n41 × N objects"| P3
-
-    P3 <-->|"nuance prompt (8 cats) →\n← JSON {flag, risk_level, reason}"| LLM
-    P3 -->|"RiskFlag[]"| P4
-
-    P4 -->|"MERGE Document, Clause,\nParty, Jurisdiction,\nDuration, MonetaryAmount"| NEO4J
-    P4 -->|"graph_built: bool"| P5
-
-    NEO4J -->|"value_conflict rows\n{clause_type, doc_id_a/b,\nvalue_a/b}"| P5
-    NEO4J -->|"absence_conflict rows\n{clause_type, found_a,\nvalue_a/b}"| P5
-    P5 <-->|"explanation prompt →\n← JSON {risk_level, explanation}"| LLM
-    P5 -->|"Contradiction[]"| P6
-
-    P6 <-->|"narrative prompt →\n← JSON {executive_summary,\nrecommended_actions}"| LLM
-    P6 -->|"final_report: str (Markdown)"| JOBSTORE
-
-    JOBSTORE -->|"JobRecord\n{status, report, errors}"| CLIENT
-    CLIENT -->|"POST /jobs/{id}/qa\n{question: str}"| P6
-    QDRANT -->|"RetrievedChunk[] (cross-doc\nscoped to job doc_ids)"| P6
-    P6 -->|"answer + citations[]"| CLIENT
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  INGESTION  (runs once per job; results persisted to Qdrant)            │
+└─────────────────────────────────────────────────────────────────────────┘
 
-> **Scope:** Production path only. No caching — every ingestion embeds fresh via GPU.
-> **Neo4j bypass:** If `neo4j_ready=False`, P4 is skipped; P5 returns `[]` immediately; report notes the skip.
-> **Qdrant bypass:** If `qdrant_ready=False`, P2/P3/P4/P5 all skipped; P6 generates report from empty state.
+ Raw files  (PDF / DOCX / TXT)
+   │
+   │  loader.py  (PyMuPDF page-by-page / python-docx paragraphs)
+   ▼
+ LoadedDocument
+   { doc_id: str,  file_path: str,  total_pages: int,
+     pages: list[PagedText { page_number: int,  text: str }] }
+   │
+   │  chunker.py  _merge_headings() → _parent_child_chunks()
+   │  bge-m3 tokenizer — token-ID level slicing, no roundtrip drift
+   │  Parents: 2048 tokens, contiguous (no inter-parent overlap)
+   │    └─ Children: 256 tokens, 51-token overlap within each parent
+   ▼
+ list[Chunk]  (one entry per child chunk)
+   { chunk_id: UUID,               ← Qdrant point ID
+     doc_id: str,
+     page_number: int,
+     text: str,                    ← 256-token child — embedded for retrieval
+     parent_text: str,             ← 2048-token parent — passed to LLM
+     parent_id: UUID,              ← dedup key in retriever Stage 1
+     parent_chunk_index: int,      ← doc-order re-sort key in Stage 2
+     token_count: int }
+   │
+   │  embedder.py  (BAAI/bge-m3, MPS fp16, batch=24)
+   │  dense:  CLS-pool → L2-norm → float[1024]
+   │  sparse: sparse_linear head (CPU) → SPLADE weights
+   │  child text only — parent_text stored in payload, not embedded
+   ▼
+ list[EmbeddedChunk]
+   { chunk_id: UUID,
+     vector: float[1024],            ← dense cosine
+     sparse_vector: dict[int,float]  ← sparse SPLADE }
+   │
+   │  indexer.py  (batches of 100, idempotent on chunk_id)
+   ▼
+ Qdrant  collection: legal_clauses
+   point { id: chunk_id,
+           vectors: { "dense": float[1024],  "sparse": SparseVector },
+           payload: { text, parent_text, parent_id, parent_chunk_index,
+                      doc_id, file_path, page_number, token_count } }
+```
 
 ---
 
-### Eval Harness DFD (with Embedding Cache)
+## System DFD — LangGraph Pipeline
 
-```mermaid
-graph TD
-    CUAD(["`**CUAD Dataset**
-    chenghao/cuad_qa
-    1,244 test rows`"])
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LANGGRAPH PIPELINE  (per job; single GraphState flows node to node)    │
+└─────────────────────────────────────────────────────────────────────────┘
 
-    CACHE[("`**Embedding Cache**
-    eval/cache/embeddings_{slug}.pkl
-    key: MD5(child_text)`")]
+ GraphState  { job_id: str,  documents: list[DocumentRecord],
+               errors: list[str],  status: str,  ... }
+   │
+   │  health_check  (infrastructure/health_check.py)
+   │  HTTP ping → Qdrant     Bolt ping → Neo4j
+   ▼
+ + qdrant_ready: bool
+ + neo4j_ready: bool
+   │
+   ├─ qdrant_ready=False ──────────────────────────────────────────────┐
+   │                                                                    │
+   │  clause_extractor  (agents/clause_extractor/agent.py)             │
+   │  per (doc × category): bge-m3 query → Qdrant hybrid RRF top-20   │
+   │  Stage 1: score-order parent_id dedup (best child per parent)     │
+   │  Stage 2: doc-order re-sort by parent_chunk_index                 │
+   │  15 hard categories: 2–3 alt queries, RRF scores summed           │
+   │  LLM: groq/llama-3.1-8b → llama-4-scout → ollama/mistral-nemo    │
+   │  asyncio.gather per doc × category;  Semaphore(10) global cap     │
+   ▼                                                                    │
+ + extracted_clauses: list[ExtractedClause]                            │
+     { document_id, clause_type,  found: bool,                         │
+       clause_text: str|None,  normalized_value: str|None,             │
+       confidence: float,  source_chunk_id: str }   ← 41 × N objects  │
+   │                                                                    │
+   │  risk_scorer  (agents/risk_scorer/agent.py)                       │
+   │  Pass 1: deterministic rules — missing clauses + presence flags   │
+   │  Pass 2: LLM reasoning for 8 nuanced categories only              │
+   ▼                                                                    │
+ + risk_flags: list[RiskFlag]                                          │
+     { document_id, clause_type,                                        │
+       risk_level: "high"|"medium"|"low",                               │
+       reason: str,  is_missing_clause: bool,                          │
+       source_clause_id: str|None }                                    │
+   │                                                                    │
+   ├─ neo4j_ready=False ─────────────────────────────────┐             │
+   │                                                     │             │
+   │  entity_mapper  (agents/entity_mapper/agent.py)     │             │
+   │  MERGE Document + Clause nodes for all clauses      │             │
+   │  extracts Party, Jurisdiction, Duration,            │             │
+   │  MonetaryAmount from normalized_value               │             │
+   │  fully idempotent (MERGE, not CREATE)               │             │
+   ▼                                                     │             │
+ + graph_built: True  (Neo4j graph populated)            │             │
+   │                                                     │             │
+   │  contradiction_detector  ◄──────────────────────────┘             │
+   │  (agents/contradiction_detector/agent.py)                         │
+   │  Cypher 1: value conflicts — same clause_type, different value    │
+   │  Cypher 2: absence conflicts — present in A, missing in B         │
+   │  both queries scoped to $doc_ids (no cross-job leakage)           │
+   │  LLM: plain-English risk explanation per conflict found           │
+   ▼                                                                    │
+ + contradictions: list[Contradiction]                                 │
+     { clause_type,  document_id_a,  document_id_b,                    │
+       value_a: str,  value_b: str,                                    │
+       explanation: str,  risk_level: "high"|"medium"|"low" }          │
+   │                                                                    │
+   │  report_qa  ◄──────────────────────────────────────────────────────┘
+   │  (agents/report_qa/agent.py)
+   │  Step 1: deterministic formatter — risk table + contradiction table
+   │          (pure Python, no LLM; tables cannot be hallucinated)
+   │  Step 2: one LLM call → { executive_summary, recommended_actions }
+   │          _template_narrative() fallback if LLM fails
+   │  Step 3: assemble_report() slots narrative into fixed Markdown template
+   ▼
+ + final_report: str  (Markdown brief — always populated, never None)
+   │
+   ▼  END
+ runner.py:  JOB_STORE[job_id].report = final_report
+             record.status = JobStatus.done
+```
 
-    QDRANT2[("`**Qdrant**
-    ephemeral per-eval run
-    scoped to eval doc_ids`")]
+---
 
-    E0["`**Load + Chunk**
-    same Chunker config as prod
-    256-child / 2048-parent`"]
-    E1["`**Cache Check**
-    slug = model + chunk params
-    auto-invalidates on config change`"]
-    E2["`**BGE-M3 GPU Pass**
-    MPS fp16 · batch=24
-    ~8s/row cold`"]
-    E3["`**Embed Questions**
-    primary + alt queries (15 hard cats)
-    batched upfront — not per-row`"]
-    E4["`**Recall@K Loop**
-    enrich-queries + multi-query RRF
-    hit@1, hit@3 per row`"]
-    E5["`**Results JSON**
-    eval/results/{name}.json`"]
-    E6["`**analyze_categories.py**
-    per-category R@3
-    worst-first sort`"]
+### Eval Harness DFD
 
-    CUAD --> E0
-    E0 -->|"child chunks"| E1
-    E1 -->|"cache miss\nuncached texts"| E2
-    E2 -->|"dense+sparse tensors"| CACHE
-    E1 -->|"cache hit\n~1s warm load"| QDRANT2
-    CACHE -->|"tensors from disk"| QDRANT2
-    QDRANT2 --> E3
-    E3 --> E4
-    E4 -->|"per-row results"| E5
-    E5 --> E6
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  EVAL HARNESS  (eval-only; embedding cache not used in production)      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+ CUAD test rows  (chenghao/cuad_qa · 1,244 rows · fixed sample_ids.json)
+   │
+   │  load + chunk  (same Chunker config as production)
+   │  256-child / 2048-parent
+   ▼
+ list[Chunk]
+   │
+   │  cache check  eval/cache/embeddings_{slug}.pkl
+   │  slug encodes model + chunk_size + child_size + overlap
+   │  key: MD5(child_text)   auto-invalidates on config change
+   │
+   ├─ cache miss ──────────────────────────────────────────────────────┐
+   │                                                                    │
+   │  BGE-M3 GPU pass  (MPS fp16 · batch=24 · ~8s/row)                │
+   ▼                                                                    │
+ tensors saved to cache  ◄──────────────────────────────────────────────┘
+   │
+   │  cache hit: warm load ~1s  (GPU skipped entirely)
+   ▼
+ Qdrant  ephemeral upsert  (scoped to eval doc_ids)
+   │
+   │  embed_questions()
+   │  primary queries + alt queries for 15 hard categories
+   │  batched upfront — not re-embedded per row
+   ▼
+ Recall@K eval loop  (enrich-queries + multi-query RRF)
+   { hit_at_1: bool,  hit_at_3: bool }  per row
+   │
+   ▼
+ eval/results/{name}.json  →  analyze_categories.py
+                               per-category R@3 · worst-first sort
 ```
 
 > **Speedup:** Cold run ≈ 50 min. Warm run (cache hit) ≈ 2 min (30×). Question embeddings not cached — always re-embeds (~22s for 360 questions).
