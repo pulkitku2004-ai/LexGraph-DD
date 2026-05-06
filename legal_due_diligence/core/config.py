@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import Field, computed_field
+from pydantic import Field, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,54 +33,32 @@ class Settings(BaseSettings):
     # ── LLM ──────────────────────────────────────────────────────────────────
     # Provider API keys — pydantic-settings reads these from .env automatically.
     #
-    # THREE PROVIDERS, THREE ROLES — why each one:
+    # EXTRACTION CHAIN (41 cats × 50 docs = ~2050 calls/job):
+    #   gpt-4o-mini (primary) → ollama/mistral-nemo (fallback)
     #
-    # 1. GROQ  →  extraction (high-volume, latency-sensitive)
-    #    - llama-3.1-8b-instant: fastest available inference, ~300ms/call
-    #    - Free tier: 6000 TPM — sufficient with fallback chain
-    #    - 41 categories × 50 docs = 2050 calls per job; cloud quality is overkill
-    #      for structured JSON extraction; speed and throughput matter more
-    #    - DO NOT use Groq for reasoning: 6000 TPM drains fast at reasoning
-    #      token lengths, and Groq models are optimised for speed not nuance
+    #   gpt-4o-mini is the primary: Cond. F1 0.617 vs 0.42 for llama-3.1-8b.
+    #   Groq was removed in Sprint 26 — all roles now use gpt-4o-mini for
+    #   consistent output quality; Groq fallback caused ASTR-O groundedness
+    #   failures due to paraphrasing. Ollama is the sole offline fallback.
     #
-    # 2. OLLAMA  →  reasoning fallback + large batch jobs (zero cost, zero rate limit)
-    #    - mistral-nemo 7.1GB on M4: reliable when cloud limits are hit
-    #    - No internet required, full privacy — useful when testing offline
-    #    - Ceiling: 7B params — quality degrades on nuanced legal risk assessment
-    #      compared to 70B+ cloud models; acceptable for dev and large batches
-    #    - DO NOT use Ollama for extraction at scale: slower than Groq, blocks
-    #      the M4 GPU for embedding if both run simultaneously
-    #    - Best role: final fallback that never fails (no rate limit, no cost)
-    #
-    # 3. OPENROUTER (FREE TIER)  →  reasoning quality upgrade for small/medium jobs
-    #    - Free tier specifics:
-    #        * Requires `:free` suffix on model names (e.g. deepseek/deepseek-r1:free)
-    #        * Rate limits: ~20 req/min, ~200 req/day depending on model
-    #        * No cost, but no guaranteed throughput — same constraint as Groq free
-    #    - IS IT BENEFICIAL for small jobs (≤25 docs)? YES:
-    #        * deepseek-r1:free and llama-3.3-70b:free reason far better than
-    #          mistral-nemo 7B on nuanced legal language at zero cost
-    #        * ~200 reasoning calls (8 cats × 25 docs) fits within daily free limit
-    #        * Single key, no separate Anthropic/OpenAI account needed
-    #    - IS IT BENEFICIAL for large jobs (50 docs)? NO:
-    #        * 8 categories × 50 docs = ~400 reasoning calls → hits daily limit mid-run
-    #        * Use Ollama directly for 50-doc batches — unlimited, no interruption
-    #    - NOT beneficial for extraction at any scale: rate limits make it unreliable
-    #      at 2050 calls/job; Groq free tier is strictly better for extraction volume
-    #
-    # DECISION GUIDE — set LLM_REASONING_MODEL in .env:
-    #   Small batch (≤25 docs):  openrouter/nvidia/nemotron-3-super-120b-a12b:free  ← verified working
-    #                            openrouter/nousresearch/hermes-3-llama-3.1-405b:free  ← 405B, may rate-limit
-    #                            openrouter/meta-llama/llama-3.3-70b-instruct:free    ← may rate-limit
-    #   Large batch (50 docs):   ollama/mistral-nemo                                  ← rate-limit safe
-    #   Offline / no internet:   ollama/mistral-nemo
-    #   Extraction always:       groq/llama-3.1-8b-instant → fallbacks (no change needed)
-    #
-    # Note: deepseek/deepseek-r1:free is NOT available on this account's free tier.
+    # REASONING (risk scorer, report narrative, Q&A — low volume):
+    #   gpt-4o-mini (default) — same key, separate role.
+    #   Override with LLM_REASONING_MODEL in .env for large batches or offline use:
+    #     Large batch (50 docs):  ollama/mistral-nemo                                 ← unlimited
+    #     Small batch (≤25 docs): openrouter/nvidia/nemotron-3-super-120b-a12b:free  ← verified working
+    #     Offline:                ollama/mistral-nemo
+    #   Note: deepseek/deepseek-r1:free is NOT available on this account's free tier.
 
-    groq_api_key: str = Field(default="", description="Groq API key — extraction only")
-    openrouter_api_key: str = Field(
-        default="",
+    openai_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="OpenAI API key — primary extraction model (gpt-4o-mini). Required for ASTR-O.",
+    )
+    groq_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Groq API key — extraction fallback",
+    )
+    openrouter_api_key: SecretStr = Field(
+        default=SecretStr(""),
         description=(
             "OpenRouter API key (free tier) — reasoning for small/medium jobs (≤25 docs). "
             "Use `:free` suffix on model names. Rate limits: ~200 req/day. "
@@ -93,31 +71,21 @@ class Settings(BaseSettings):
         description="Ollama server URL — local reasoning fallback, zero cost, zero rate limit",
     )
 
-    # LiteLLM model strings — prefix tells LiteLLM which provider to route to.
-    # Two tiers:
-    #   Extraction (high volume, ~2050 calls for 50 docs): Groq Llama fast inference
-    #   Reasoning (low volume, quality matters): Ollama locally (dev) or OpenRouter (prod)
     llm_reasoning_model: str = Field(
-        default="ollama/mistral-nemo",
-        description=(
-            "Model for risk scoring and report synthesis — quality over speed. "
-            "Default: ollama/mistral-nemo (local, unlimited, good for large batches). "
-            "Small job upgrade (≤25 docs): openrouter/deepseek/deepseek-r1:free "
-            "or openrouter/meta-llama/llama-3.3-70b-instruct:free — "
-            "note `:free` suffix required; ~200 req/day limit applies."
-        ),
+        default="gpt-4o-mini",
+        description="Model for risk scoring, report synthesis, and Q&A.",
     )
     llm_extraction_model: str = Field(
-        default="groq/llama-3.1-8b-instant",
-        description="Primary extraction model — Groq fast inference, free tier sufficient at this volume",
+        default="gpt-4o-mini",
+        description="Primary extraction model. Override via LLM_EXTRACTION_MODEL in .env.",
     )
-    # Fallback chain for extraction — each has its own rate limit bucket.
-    # LiteLLM tries these in order when the primary is rate limited.
-    # OpenRouter is deliberately excluded from extraction fallbacks: per-token
-    # cost at 2050 calls/job is not justified when Ollama (free, local) is available.
     llm_extraction_fallbacks: list[str] = Field(
-        default=["groq/meta-llama/llama-4-scout-17b-16e-instruct", "ollama/mistral-nemo"],
-        description="Fallback models for extraction in priority order",
+        default=["ollama/mistral-nemo"],
+        description=(
+            "Ordered fallback chain for extraction. Sprint 26: Groq removed — "
+            "all roles use gpt-4o-mini; Ollama is the sole local fallback with "
+            "no rate limit and no quality mismatch risk for ASTR-O groundedness."
+        ),
     )
 
     # ── Qdrant ───────────────────────────────────────────────────────────────
@@ -218,9 +186,18 @@ class Settings(BaseSettings):
     # Empty string (default) = auth disabled — safe for local dev.
     # Set API_KEY=<secret> in .env to enable. All endpoints require
     # Authorization: Bearer <key>. The Streamlit UI reads the same var.
-    api_key: str = Field(
-        default="",
+    api_key: SecretStr = Field(
+        default=SecretStr(""),
         description="Bearer token for API auth. Empty = disabled (local dev).",
+    )
+
+    # ── Observability ────────────────────────────────────────────────────────
+    # OTLP HTTP endpoint for OpenTelemetry span export.
+    # Empty (default) = no export; spans are created but dropped (zero overhead).
+    # Example: http://localhost:4318 for a local OTel collector.
+    otel_endpoint: str = Field(
+        default="",
+        description="OTLP HTTP endpoint for OTel span export. Empty = disabled.",
     )
 
     # ── Application ──────────────────────────────────────────────────────────
@@ -254,10 +231,12 @@ settings = get_settings()
 # pydantic-settings reads .env into the settings object but does NOT write
 # back to os.environ, so LiteLLM (which reads os.environ directly) would
 # miss keys that are only in .env and not already exported in the shell.
-if settings.openrouter_api_key:
-    os.environ.setdefault("OPENROUTER_API_KEY", settings.openrouter_api_key)
-if settings.groq_api_key:
-    os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
+if settings.openai_api_key.get_secret_value():
+    os.environ.setdefault("OPENAI_API_KEY", settings.openai_api_key.get_secret_value())
+if settings.openrouter_api_key.get_secret_value():
+    os.environ.setdefault("OPENROUTER_API_KEY", settings.openrouter_api_key.get_secret_value())
+if settings.groq_api_key.get_secret_value():
+    os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key.get_secret_value())
 
 # Suppress litellm's verbose request/response logging globally.
 # Set once here so agent modules don't each repeat it.

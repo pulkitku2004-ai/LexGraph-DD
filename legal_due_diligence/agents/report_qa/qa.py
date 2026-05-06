@@ -29,55 +29,67 @@ RiskFlag.source_clause_id.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import litellm
 
-from agents.clause_extractor.retriever import RetrievedChunk, retrieve
+from agents.clause_extractor.retriever import RetrievedChunk, retrieve_with_metadata
 from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_QA_SYSTEM_PROMPT = """You are a legal due diligence assistant answering questions about contracts.
-Answer based ONLY on the contract excerpts provided. Be precise and cite which document you are drawing from.
-If the answer cannot be determined from the provided excerpts, say so explicitly — do not speculate."""
+_QA_SYSTEM_PROMPT = """You are a legal document retrieval system.
+Output ONLY verbatim sentences or phrases copied character-for-character from the excerpts that answer the question.
+Do not write any introduction, framing, bullets, numbers, document names, or words of your own.
+If no relevant text exists in the excerpts, output exactly: NOT_FOUND"""
 
 
 def _retrieve_across_docs(
     question: str,
     doc_ids: list[str],
     top_k_per_doc: int = 3,
-) -> list[RetrievedChunk]:
+) -> tuple[list[RetrievedChunk], dict]:
     """
     Retrieve relevant chunks across all documents in doc_ids.
 
-    Calls per-document retrieve() for each doc_id and merges results by RRF
-    score. Each doc contributes up to top_k_per_doc chunks; the final list is
-    sorted by descending RRF score so the most relevant passages surface first.
+    Calls per-document retrieve_with_metadata() for each doc_id, merges results
+    by RRF score, and returns both the final chunk list and the full retrieval
+    metadata (all pre-truncation ranked chunks per doc) for ASTR-O span emission.
 
-    Why per-doc calls rather than a single cross-doc Qdrant query?
-    The BM25 index has no filter API — it requires per-doc post-filtering.
-    Using the existing retrieve() keeps both BM25 and dense retrieval
-    consistent between extraction and Q&A. The overhead is negligible for ≤50
-    documents.
+    Returns:
+        (chunks, retrieval_metadata)
+        retrieval_metadata shape matches ASTR-O's expected span structure:
+          {query, retrieval_method, top_k, retrieved_chunks, all_ranked_chunks, retrieval_timestamp}
     """
     all_chunks: list[RetrievedChunk] = []
+    all_ranked_flat: list[dict] = []
+
     for doc_id in doc_ids:
-        chunks = retrieve(question, doc_id, top_k=top_k_per_doc)
+        chunks, ranked = retrieve_with_metadata(question, doc_id, top_k=top_k_per_doc)
         all_chunks.extend(chunks)
+        # Tag each ranked entry with its doc_id so ASTR-O can trace cross-doc conflicts
+        for entry in ranked:
+            all_ranked_flat.append({**entry, "doc_id": doc_id})
 
-    # Re-rank by RRF score descending — same signal used within each doc
     all_chunks.sort(key=lambda c: c.rrf_score, reverse=True)
+    final_chunks = all_chunks[: top_k_per_doc * 2]
 
-    # Return at most top_k_per_doc * 2 chunks (enough context, not too many tokens)
-    return all_chunks[: top_k_per_doc * 2]
+    retrieval_metadata = {
+        "query": question,
+        "retrieval_method": "hybrid_rrf",
+        "top_k": top_k_per_doc,
+        "retrieved_chunks": [c.chunk_id for c in final_chunks],
+        "all_ranked_chunks": all_ranked_flat,
+        "retrieval_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return final_chunks, retrieval_metadata
 
 
 def _build_qa_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
     context_parts = []
     for i, chunk in enumerate(chunks, start=1):
-        context_parts.append(
-            f"[Excerpt {i} — {chunk.doc_id}, page {chunk.page_number}]\n{chunk.text.strip()}"
-        )
+        context_parts.append(f"[Excerpt {i}]\n{chunk.text.strip()}")
     context = "\n\n".join(context_parts)
 
     return f"""Contract excerpts:
@@ -88,7 +100,7 @@ def _build_qa_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
 
 Question: {question}
 
-Answer based only on the excerpts above. Reference the document and page where relevant."""
+Copy verbatim sentences from the excerpts above that answer the question. No other words."""
 
 
 def _call_qa_llm(prompt: str) -> str | None:
@@ -140,12 +152,14 @@ def answer_question(
     """
     logger.info("[qa] question=%r across %d doc(s): %s", question[:60], len(doc_ids), doc_ids)
 
-    chunks = _retrieve_across_docs(question, doc_ids, top_k_per_doc=top_k_per_doc)
+    chunks, retrieval_metadata = _retrieve_across_docs(question, doc_ids, top_k_per_doc=top_k_per_doc)
     if not chunks:
         return {
             "answer": "No relevant contract excerpts were found for this question.",
             "citations": [],
             "chunks_retrieved": 0,
+            "retrieval_metadata": retrieval_metadata,
+            "enriched_chunks": [],
         }
 
     prompt = _build_qa_prompt(question, chunks)
@@ -164,9 +178,22 @@ def answer_question(
         for c in chunks
     ]
 
+    # enriched_chunks = the content actually sent to the LLM (child chunk text + provenance)
+    enriched_chunks = [
+        {
+            "chunk_id": c.chunk_id,
+            "doc_id": c.doc_id,
+            "page_number": c.page_number,
+            "text": c.text.strip(),
+        }
+        for c in chunks
+    ]
+
     logger.info("[qa] answered with %d citation(s)", len(citations))
     return {
         "answer": answer,
         "citations": citations,
         "chunks_retrieved": len(chunks),
+        "retrieval_metadata": retrieval_metadata,
+        "enriched_chunks": enriched_chunks,
     }

@@ -45,3 +45,5 @@ class QAResponse(BaseModel):
     answer: str
     citations: list[Citation]
     chunks_retrieved: int
+    retrieval_metadata: dict | None = None
+    enriched_chunks: list[dict] | None = None

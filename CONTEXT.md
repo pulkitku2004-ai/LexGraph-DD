@@ -1,7 +1,7 @@
 # LexGraph-DD — Master Context
 
-**Last updated:** 2026-04-20
-**Status:** PROJECT CLOSED. Sprint 23 complete. Sprint 24 (JOB_STORE SQLite persistence) was in scope but project was called off after final extraction quality evaluation confirmed a model capability ceiling — not addressable without a better extraction model or contrastive fine-tuning. All retrieval and extraction improvement avenues exhausted. System is production-ready for a prototype; limitations documented below and in README.
+**Last updated:** 2026-05-02
+**Status:** ACTIVE — Sprint 26 (ASTR-O full integration) complete. Project was closed after Sprint 24 confirmed a llama-3.1-8b extraction ceiling (Cond. F1 ≈ 0.42). Reopened 2026-05-02: Sprint 25 added ASTR-O observability and switched extraction to `gpt-4o-mini` (Cond. F1 0.617, +19.6pp). Sprint 26 unified all LLM roles to gpt-4o-mini and ran a 30-contract CUAD integration test against ASTR-O (13/15 spans SAFE, 86.7%).
 
 **Post-close cleanup (2026-04-20):** Low-risk code quality pass — dead field removal (`chunk_overlap`, `reranker_model`), `litellm.suppress_debug_info` centralized to `core/config.py`, duplicate JSON fence-stripping extracted to `core/utils.strip_json_fence()`, `Optional[X]` modernized to `X | None` throughout.
 
@@ -46,8 +46,8 @@ source /path/to/legal_dd/.venv/bin/activate   # every session
 | Vector store | Qdrant (Docker) | use `query_points()` not `search()` |
 | Knowledge graph | Neo4j 5 (Docker) | Bolt :7687, browser :7474 |
 | LLM routing | LiteLLM 1.83.4 | Provider portability + fallback chain |
-| LLM extraction | groq/llama-3.1-8b-instant → groq/llama-4-scout-17b → ollama/mistral-nemo | Fallback chain |
-| LLM reasoning | ollama/mistral-nemo (large batch) / OpenRouter free (≤25 docs) | |
+| LLM extraction | gpt-4o-mini (primary) → ollama/mistral-nemo | Sprint 26: Groq removed; all roles unified to gpt-4o-mini |
+| LLM reasoning | gpt-4o-mini | Sprint 26: unified with extraction; Ollama offline fallback only |
 | Embeddings | BAAI/bge-m3 | 1024-dim dense + learned SPLADE sparse; no BM25 pickle |
 | ML | PyTorch 2.11.0, MPS active | bge-m3 fp16 on MPS; sparse_linear on CPU |
 | PDF/DOCX | pymupdf 1.27.2.2, python-docx 1.2.0 | |
@@ -86,6 +86,8 @@ python run_sprint1.py         # re-index after wipe (no pickle — sparse in Qdr
 | 22 | Case-insensitive enrichment/alt-query lookup fix + Affiliate License-Licensor alt queries → R@3 68.0%→68.3% | ✅ DONE |
 | 23 | Pipeline quality: e2e baseline ✅ + `trim_clause_text()` ✅ + risk scorer category prompts ✅ + contradiction detector fixes ✅ + extraction hints ✅ + auth ✅ | ✅ DONE |
 | 24 | Verbatim prompt test (Cond. F1 0.421→0.373, −4.8pp, rejected) → extraction quality ceiling confirmed → project closed | ✅ DONE (closed) |
+| 25 | ASTR-O compatibility: `retrieval_metadata` per retrieval call, extraction LLM → gpt-4o-mini, minimal OTel, HTTP test runner → `process_lexgraph_span()` | ✅ DONE |
+| 26 | ASTR-O full integration: all LLM roles → gpt-4o-mini (Groq removed), verbatim-only Q&A prompt, 30-contract CUAD integration test → 13/15 SAFE (86.7%) | ✅ DONE |
 
 ---
 
@@ -128,6 +130,8 @@ R@1:  39.6%    R@3:  68.3%   (Sprint 22 — full 1244 rows, Apr 17, definitive)
 
 **Extraction ceiling declared at Cond. F1 ≈ 0.42 (llama-3.1-8b-instant).** Improving this requires either a larger model (e.g. llama-3.1-70b) or a CUAD fine-tuned extraction model.
 
+**Extraction ceiling broken (Sprint 25):** Switching to gpt-4o-mini as the extraction primary yields Cond. F1 0.617 (+19.6pp), Token F1 0.540, Substring Match 42.7%, Found Rate 87.5% — clean 192-row run, no fallback, fresh cache (`eval/cache/llm_responses_gpt_4o_mini.pkl`). This confirms the ceiling was model-specific to llama-3.1-8b, not a retrieval or prompt problem.
+
 **Per-category breakdown (Sprint 20, full 1244-row, Apr 17 — authoritative):**
 
 | Category | R@3 | n | vs Sprint 19 |
@@ -160,6 +164,7 @@ Sprint 18 query enrichment changes (6 categories): net neutral on overall R@3 (6
 | 23 (no-trim, cached A/B) | 82.3% | 0.378 | — | 24.5% | trim=no; clean baseline |
 | 24 (model-mixed baseline) | 83.3% | 0.350 | 0.421 | 22.4% | Groq TPD hit mid-run → ollama fallback. Not authoritative. |
 | 24 (verbatim prompt, model-mixed) | 86.5% | 0.322 | 0.373 | 18.8% | Verbatim instruction added. Same confound. **Rejected −4.8pp Cond. F1.** |
+| **25 (gpt-4o-mini, clean, 192 rows)** | **87.5%** | **0.540** | **0.617** | **42.7%** | OpenAI primary, no fallback, clean cache. **Breaks llama ceiling by +19.6pp Cond. F1.** |
 
 **Sprint 23 trimmer finding:** `trim_clause_text()` has negligible effect on token F1: +0.003 when disabled (within noise). Kept — logically correct for cleaner risk/contradiction input even if CUAD token F1 can't measure it.
 
@@ -179,17 +184,23 @@ legal_dd/
 ├── run_sprint{0,1,3,4,5,6,7,9}.py   ← smoke tests
 ├── analyze_categories.py   ← per-category R@3 from eval JSON; accepts file arg (fixed Sprint 18 — was hardcoded to wrong file)
 ├── samples/contract_{a,b}.txt        ← deliberate contradictions for testing
+├── astro_req.md            ← Sprint 25 ASTR-O change log + retrieval_metadata shapes + live test results
+├── test_runner_for_astr_o.py  ← HTTP job lifecycle → ASTR-O span dict → process_lexgraph_span()
+├── test_retrieval_metadata.py ← live Qdrant test for retrieve_with_metadata() shape
 ├── eval/
 │   ├── cuad_eval.py        ← Recall@K harness (Sprint 19: embedding cache, dead code removed)
 │   ├── e2e_eval.py         ← end-to-end extraction eval (Token F1 + found rate)
 │   ├── sample_ids.json
-│   ├── cache/              ← Sprint 19: chunk embedding cache (pkl, keyed by model+chunk params)
-│   │   └── embeddings_bge_m3_p2048_c256_o51.pkl   ← 5,199 entries, ~50 min → ~2 min repeat
+│   ├── cache/              ← chunk embedding cache + LLM response cache (keyed by model slug)
+│   │   ├── embeddings_bge_m3_p2048_c256_o51.pkl   ← 5,199 entries, ~50 min → ~2 min repeat
+│   │   ├── llm_responses_llama_3.1_8b_instant.pkl ← 259 entries (Groq runs)
+│   │   └── llm_responses_gpt_4o_mini.pkl           ← Sprint 25 clean OpenAI run
 │   └── results/
 └── legal_due_diligence/
     ├── core/config.py, models.py, state.py, utils.py
     │         └── utils.py  ← strip_json_fence() shared by clause_extractor, risk_scorer, report_qa
-    ├── infrastructure/qdrant_client.py, neo4j_client.py, health_check.py
+    ├── infrastructure/qdrant_client.py, neo4j_client.py, health_check.py, observability.py
+    │         └── observability.py  ← Sprint 25: OTel TracerProvider; no-op if OTEL_ENDPOINT unset
     ├── ingestion/loader.py, chunker.py, embedder.py, indexer.py
     ├── agents/
     │   ├── orchestrator/graph.py
@@ -351,7 +362,7 @@ START → health_check
    │  Stage 1: score-order parent_id dedup (best child per parent)     │
    │  Stage 2: doc-order re-sort by parent_chunk_index                 │
    │  15 hard categories: 2–3 alt queries, RRF scores summed           │
-   │  LLM: groq/llama-3.1-8b → llama-4-scout → ollama/mistral-nemo    │
+   │  LLM: gpt-4o-mini → ollama/mistral-nemo (fallback)               │
    │  asyncio.gather per doc × category;  Semaphore(10) global cap     │
    ▼                                                                    │
  + extracted_clauses: list[ExtractedClause]                            │
@@ -479,7 +490,17 @@ START → health_check
 
 **Multi-query (`CUAD_ALT_QUERIES`):** 15 hard categories fire 2–3 alt queries, sum RRF scores (consensus boost), same two-stage dedup. Confirmed +6.1pp R@3. Alt query embeddings pre-batched upfront in `embed_questions()` (Sprint 18 fix — was per-row GPU call in eval loop).
 
-**LLM:** groq/llama-3.1-8b → groq/llama-4-scout → ollama/mistral-nemo. temperature=0, max_tokens=300. JSON output → parse → ExtractedClause. Any failure → found=False, confidence=0.0.
+**LLM (Sprint 26):** gpt-4o-mini (primary) → ollama/mistral-nemo (fallback). Groq removed in Sprint 26 — all roles unified to gpt-4o-mini for consistent output quality. temperature=0, max_tokens=300. JSON output → parse → ExtractedClause. Any failure → found=False, confidence=0.0. LiteLLM reads all provider keys from `os.environ` (set by config.py) — no `api_key=` kwarg passed to `litellm.completion()`.
+
+**Retrieval metadata (Sprint 25):** `_extract_category_async` now calls `retrieve_with_metadata()` / `retrieve_multi_with_metadata()` instead of the plain variants. Assembles `retrieval_metadata` dict and attaches to OTel span as `span.set_attribute("retrieval_metadata", json.dumps(...))`. Original `retrieve()` / `retrieve_multi()` signatures unchanged — eval harness unaffected.
+
+**New retriever internals (Sprint 25):**
+- `RetrievedChunk` gets `dense_score: float | None` and `sparse_score: float | None` fields
+- `_retrieve_fused(query, doc_id, candidate_k)` — private; shared by both retrieve() and retrieve_with_metadata()
+- `_retrieve_multi_fused(queries, doc_id, candidate_k)` — private; shared similarly
+- `_build_ranking_metadata(fused)` — serializes pre-truncation list: chunk_id, rank, dense_score, sparse_score, rrf_score, dense_rank, sparse_rank, reason_for_rank
+- `retrieve_with_metadata(query, doc_id, top_k, candidate_k) → (chunks, all_ranked)`
+- `retrieve_multi_with_metadata(queries, doc_id, top_k, candidate_k) → (chunks, all_ranked)`
 
 **Post-extraction trimming (`trim_clause_text()` — Sprint 23):** Applied at parse time in `_parse_response()`. Strips section headers that LLM includes when 2048-token parents give it too much context. Logic:
 1. Strip leading section numbers: `12.1 ` / `12.1. ` / `3. ` (two-arm regex to avoid stripping "3 months")
@@ -528,6 +549,8 @@ LLM explanation per conflict (template fallback on failure). Returns `list[Contr
 **Report:** Deterministic formatter builds risk table + contradiction table (no LLM). One LLM call → JSON `{executive_summary, recommended_actions}`. `_template_narrative()` fallback if LLM fails — `final_report` always populated.
 
 **Q&A** (`POST /jobs/{id}/qa`): hybrid retrieval per doc → merge by RRF → LLM answer + page-level citations. Citations trace back via `source_chunk_id → Qdrant → page_number`.
+
+**Sprint 25 Q&A additions:** `_retrieve_across_docs()` now calls `retrieve_with_metadata()` per doc and tags each ranked chunk with `doc_id`. `answer_question()` returns `retrieval_metadata` and `enriched_chunks` (list of `{chunk_id, doc_id, page_number, text}` — the parent texts actually sent to the LLM). `QAResponse` schema exposes both as optional fields. These feed directly into the ASTR-O span dict built by `test_runner_for_astr_o.py`.
 
 ---
 
@@ -621,7 +644,7 @@ Structured I/O contracts for every node in the LangGraph state machine. All node
 |---|---|
 | POST /jobs | Multipart upload, BackgroundTasks pipeline, returns job_id (202) |
 | GET /jobs/{id} | Poll: pending/running/done/error; report when done |
-| POST /jobs/{id}/qa | Q&A on completed job |
+| POST /jobs/{id}/qa | Q&A on completed job; response now includes `retrieval_metadata` and `enriched_chunks` (Sprint 25) |
 | DELETE /jobs/{id} | Wipes Qdrant points + Neo4j nodes + tempfiles (async cleanup) |
 
 `JOB_STORE`: in-memory dict. BackgroundTasks (not Celery). `python -m uvicorn` via venv Python (not pyenv shim).
@@ -632,13 +655,10 @@ Structured I/O contracts for every node in the LangGraph state machine. All node
 
 | Role | Model | Limit |
 |---|---|---|
-| Extraction primary | groq/llama-3.1-8b-instant | 6000 TPM |
-| Extraction fallback 1 | groq/llama-4-scout-17b | separate bucket |
-| Extraction fallback 2 | ollama/mistral-nemo | none |
-| Reasoning ≤25 docs | openrouter/nvidia/nemotron-3-super-120b-a12b:free | ~200 req/day |
-| Reasoning large batch | ollama/mistral-nemo | none |
+| All roles (extraction + reasoning + Q&A) | gpt-4o-mini | OpenAI pay-per-token; ~300-token extraction outputs → low cost |
+| Offline fallback | ollama/mistral-nemo | none — local, no rate limit, lower quality |
 
-`config.py` pushes keys to `os.environ` — LiteLLM reads from env directly. OpenRouter models require `:free` suffix. `deepseek-r1:free` NOT available on this account.
+Sprint 26: Groq removed from all roles. ASTR-O groundedness requires verbatim output; smaller models (Groq llama-3.1-8b, mistral-nemo) paraphrase and cause failures. `config.py` pushes `OPENAI_API_KEY` to `os.environ` — LiteLLM reads from env directly.
 
 ---
 
@@ -667,7 +687,14 @@ Structured I/O contracts for every node in the LangGraph state machine. All node
 
 **LLM:**
 - **temperature=0 everywhere except Q&A (0.1):** deterministic extraction = reproducible evals; slight randomness in Q&A for prose fluency
-- **LiteLLM fallback chain handles rate limits:** no custom retry logic in agent code; Groq primary → Groq scout → Ollama local
+- **LiteLLM fallback chain handles outages:** no custom retry logic in agent code; gpt-4o-mini primary → Ollama local (Sprint 26: Groq removed)
+- **No `api_key=` kwarg to `litellm.completion()`:** config.py pushes all provider keys to `os.environ` at startup; passing a Groq key when the primary model is gpt-4o-mini fails authentication
+
+**ASTR-O / Observability (Sprint 25):**
+- **`infrastructure/observability.py`:** Configures OTel `TracerProvider` at import time. If `OTEL_ENDPOINT` set in env → `BatchSpanProcessor` + `OTLPSpanExporter` (HTTP). If not set → default no-op tracer (zero overhead, no code path changes needed).
+- **`retrieval_metadata` on every span:** clause_extractor attaches full pre-truncation ranked list as `span.set_attribute("retrieval_metadata", json.dumps(...))`. Shape: `{query, alt_queries, retrieval_method, retrieved_chunk_ids, all_ranked_chunks, retrieval_timestamp}`. Each ranked chunk carries `chunk_id, rank, dense_score, sparse_score, rrf_score, dense_rank, sparse_rank, reason_for_rank`.
+- **ASTR-O span dict:** `test_runner_for_astr_o.py` assembles `{span_id, trace_id, retrieval_metadata, enriched_chunks, llm_response}` from the HTTP QA response and passes to `LexGraphToASTRO.process_lexgraph_span()`. Graceful degradation: runs span validation-only if `ASTR_O_PATH` not set.
+- **`retrieve()` / `retrieve_multi()` signatures preserved:** eval harness and qa.py call these unchanged. ASTR-O variants are additive (`retrieve_with_metadata`, `retrieve_multi_with_metadata`).
 
 **Code quality (post-close cleanup 2026-04-20):**
 - **`litellm.suppress_debug_info = True` in `core/config.py`:** set once at import time, takes effect process-wide — not repeated per agent
@@ -727,6 +754,8 @@ Warm run: cache loaded in ~1s, GPU skipped, total eval ~2 min (30× speedup).
 | bm25 pickle duplicate on re-run | Gone — sparse vectors in Qdrant, no pickle |
 | Groq 6000 TPM per model | Fallback chain eliminates wait |
 | `e2e_eval.py` stale API (Sprint 23 fix) | `embed_questions()` returns `(primary_dict, alt_dict)` tuple — was captured as single value, crashing on `query_embeddings[idx]` for idx > 1. Fixed: `query_embeddings, _ = embed_questions(...)`. Also removed stale `query_text=` and `reranker=` kwargs from `eval_retrieve()` / `eval_retrieve_multi()` calls, and removed `CrossEncoder` import and `--reranker` CLI arg. |
+| `e2e_eval.py` unbound `key` variable (Sprint 25 fix) | `key = _llm_key(prompt)` was defined inside `if llm_cache is not None:` block — unbound if cache was None. Fixed: hoisted `key = _llm_key(prompt)` before the cache check; combined condition to `if llm_cache is not None and key in llm_cache:`. Also added `raw: str = ... # type: ignore[union-attr]` to silence Pyright on `choices[0].message.content` (`str \| None`). |
+| Groq key used as OpenAI key during Sprint 25 first eval | `.env` had `gsk_...` set as `OPENAI_API_KEY`. Caused AuthenticationError on gpt-4o-mini, fell back to Groq, contaminated the gpt-4o-mini LLM cache. Fix: replaced with real OpenAI key, cleared cache with `rm eval/cache/llm_responses_gpt_4o_mini.pkl`, re-ran clean. |
 
 ---
 

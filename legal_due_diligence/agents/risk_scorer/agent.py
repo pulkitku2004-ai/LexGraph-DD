@@ -9,7 +9,7 @@ Pass 1 — Deterministic rules (rules.py):
   - found=True, confidence < 0.4 → ambiguous clause (medium risk)
   These cases need no LLM: the rule is bright-line, and LLM cost is wasted.
 
-Pass 2 — LLM reasoning (ollama/mistral-nemo, settings.llm_reasoning_model):
+Pass 2 — LLM reasoning (gpt-4o-mini, settings.llm_reasoning_model):
   Only for a curated set of high-value clauses where clause_text reveals
   nuance that rules cannot capture:
     - "Is this liability cap amount actually protective?"
@@ -18,18 +18,18 @@ Pass 2 — LLM reasoning (ollama/mistral-nemo, settings.llm_reasoning_model):
   The LLM returns JSON: {"flag": bool, "risk_level": str, "reason": str}.
   If flag=False, no RiskFlag is emitted — the clause is considered standard.
 
-Why ollama/mistral-nemo for reasoning?
+Why gpt-4o-mini for reasoning? (Sprint 26 change from ollama/mistral-nemo)
   Risk flags feed the final brief that a lawyer reads. Wrong risk levels
-  have real consequences. We use the local reasoning model (not the fast
-  extraction model) for quality. When an Anthropic key is available,
-  swap settings.llm_reasoning_model to "anthropic/claude-sonnet-4-6" —
-  zero code change.
+  have real consequences. Sprint 26 unified all LLM roles to gpt-4o-mini
+  for consistent output quality — Groq/Ollama fallbacks caused paraphrasing
+  that failed ASTR-O groundedness checks. To swap models, set
+  LLM_REASONING_MODEL in .env — zero code change.
 
 Why not async?
   Risk scoring touches each clause once. Sequential execution across ~82
-  clauses (41 per doc × 2 docs) completes in seconds for local Ollama.
-  asyncio would be the right upgrade if Sprint 7 benchmarks show a
-  bottleneck, but it adds complexity before we know it's needed.
+  clauses (41 per doc × 2 docs) completes in seconds.
+  asyncio would be the right upgrade if benchmarks show a bottleneck,
+  but it adds complexity before we know it's needed.
 
 Why catch all exceptions?
   One LLM failure should not abort scoring for the remaining clauses.
@@ -179,8 +179,8 @@ def _call_reasoning_llm(prompt: str) -> str | None:
     """
     Call the reasoning LLM for nuanced clause risk assessment.
 
-    Uses settings.llm_reasoning_model (default: ollama/mistral-nemo).
-    No fallback chain needed — Ollama is local with no rate limit.
+    Uses settings.llm_reasoning_model (default: gpt-4o-mini, Sprint 26).
+    No explicit fallback chain — LiteLLM routes via os.environ keys.
     temperature=0.0 for deterministic, auditable output.
     max_tokens=150 — JSON response never exceeds 100 tokens.
     """

@@ -14,7 +14,7 @@ Sprint 12 makes both axes concurrent:
 
   Now:        docs × categories = concurrent × concurrent (under semaphore)
               wall time ≈ max(doc_extraction_times) ≈ ceil(41/10) × 300ms ≈ 1.5s
-              50 docs ≈ 1.5–5s (limited by Groq rate limits and Ollama throughput)
+              50 docs ≈ 1.5–5s (limited by OpenAI rate limits and Ollama throughput)
 
 Why asyncio.gather() across categories rather than across documents?
 Both axes are now parallelised. The single global semaphore (EXTRACTION_CONCURRENCY)
@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 
 import litellm
 
@@ -63,11 +64,17 @@ from agents.clause_extractor.prompts import (
     build_extraction_prompt,
     trim_clause_text,
 )
-from agents.clause_extractor.retriever import retrieve, retrieve_multi
+from agents.clause_extractor.retriever import (
+    retrieve,
+    retrieve_multi,
+    retrieve_with_metadata,
+    retrieve_multi_with_metadata,
+)
 from core.config import settings
 from core.models import ExtractedClause
 from core.state import GraphState
 from core.utils import strip_json_fence
+from infrastructure.observability import get_tracer
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +96,6 @@ def _call_llm(user_prompt: str) -> str | None:
             ],
             temperature=0.0,
             max_tokens=300,
-            api_key=settings.groq_api_key or None,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -101,10 +107,9 @@ async def _call_llm_async(user_prompt: str) -> str | None:
     """
     Async LLM call via litellm.acompletion().
 
-    Same fallback chain as the sync version — LiteLLM handles the cascade
-    (primary Groq → scout Groq → Ollama) transparently in async mode.
-    Called under the global semaphore in _extract_category_async() to cap
-    total concurrent Groq requests within rate-limit budget.
+    LiteLLM reads API keys from os.environ (populated by core/config.py at import).
+    Fallback chain: gpt-4o-mini → ollama/mistral-nemo (Sprint 26: Groq removed).
+    Called under the global semaphore in _extract_category_async() to cap concurrent requests.
     """
     try:
         response = await litellm.acompletion(
@@ -116,7 +121,6 @@ async def _call_llm_async(user_prompt: str) -> str | None:
             ],
             temperature=0.0,
             max_tokens=300,
-            api_key=settings.groq_api_key or None,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -194,51 +198,69 @@ async def _extract_category_async(
     The LLM call is gated by the shared semaphore — this is the rate-limit
     control point. Retrieval is allowed to run ahead (no semaphore there)
     so chunks are ready the moment the semaphore opens.
+
+    Each invocation emits one OTel span with full retrieval_metadata attached,
+    including all pre-truncation ranked chunks with dense/sparse/RRF scores.
     """
-    # ── Retrieval (sync, offloaded to thread pool) ─────────────────────────
     alt_queries = CUAD_ALT_QUERIES.get(clause_type, [])
-    if alt_queries:
-        chunks = await asyncio.to_thread(
-            retrieve_multi,
-            [retrieval_query] + alt_queries,
-            doc_id,
-            5,   # top_k: more chunks to LLM when multi-querying
-            20,  # candidate_k per query
+
+    with get_tracer().start_as_current_span("clause_extraction") as span:
+        span.set_attribute("doc_id", doc_id)
+        span.set_attribute("clause_type", clause_type)
+
+        # ── Retrieval (sync, offloaded to thread pool) ─────────────────────
+        if alt_queries:
+            chunks, all_ranked = await asyncio.to_thread(
+                retrieve_multi_with_metadata,
+                [retrieval_query] + alt_queries,
+                doc_id,
+                5,   # top_k: more chunks to LLM when multi-querying
+                20,  # candidate_k per query
+            )
+        else:
+            chunks, all_ranked = await asyncio.to_thread(
+                retrieve_with_metadata,
+                retrieval_query,
+                doc_id,
+                3,   # top_k
+                20,  # candidate_k
+            )
+
+        retrieval_metadata = {
+            "query": retrieval_query,
+            "alt_queries": alt_queries,
+            "retrieval_method": "hybrid_rrf",
+            "retrieved_chunk_ids": [c.chunk_id for c in chunks],
+            "all_ranked_chunks": all_ranked,
+            "retrieval_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        span.set_attribute("retrieval_metadata", json.dumps(retrieval_metadata))
+
+        if not chunks:
+            logger.warning(
+                "[clause_extractor] no chunks retrieved for %s/%s", doc_id, clause_type
+            )
+            span.set_attribute("found", False)
+            return _missing_clause(clause_type, doc_id, "")
+
+        source_chunk_id = chunks[0].chunk_id
+        llm_contexts = [c.parent_text if c.parent_text is not None else c.text for c in chunks]
+        prompt = build_extraction_prompt(clause_type, llm_contexts, doc_id)
+
+        # ── LLM call (async, rate-limited by semaphore) ────────────────────
+        async with sem:
+            raw_response = await _call_llm_async(prompt)
+
+        clause = _parse_response(raw_response, clause_type, doc_id, source_chunk_id)
+        span.set_attribute("found", clause.found)
+        span.set_attribute("confidence", clause.confidence)
+
+        logger.info(
+            "[clause_extractor] %s | %s | found=%s | value=%s | conf=%.2f",
+            doc_id, clause_type, clause.found,
+            clause.normalized_value or "—", clause.confidence,
         )
-    else:
-        chunks = await asyncio.to_thread(
-            retrieve,
-            query_text=retrieval_query,
-            doc_id=doc_id,
-            top_k=3,
-            candidate_k=20,
-        )
-
-    if not chunks:
-        logger.warning(
-            "[clause_extractor] no chunks retrieved for %s/%s", doc_id, clause_type
-        )
-        return _missing_clause(clause_type, doc_id, "")
-
-    source_chunk_id = chunks[0].chunk_id
-    # Use parent_text when available (parent-child chunking, Sprint 15+).
-    # parent_text is the 512-token window the child was split from — the LLM
-    # sees the full surrounding clause context instead of the 128-token child.
-    # Falls back to text (child chunk) for collections indexed before Sprint 15.
-    llm_contexts = [c.parent_text if c.parent_text is not None else c.text for c in chunks]
-    prompt = build_extraction_prompt(clause_type, llm_contexts, doc_id)
-
-    # ── LLM call (async, rate-limited by semaphore) ────────────────────────
-    async with sem:
-        raw_response = await _call_llm_async(prompt)
-
-    clause = _parse_response(raw_response, clause_type, doc_id, source_chunk_id)
-    logger.info(
-        "[clause_extractor] %s | %s | found=%s | value=%s | conf=%.2f",
-        doc_id, clause_type, clause.found,
-        clause.normalized_value or "—", clause.confidence,
-    )
-    return clause
+        return clause
 
 
 async def _extract_document_async(

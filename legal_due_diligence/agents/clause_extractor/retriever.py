@@ -80,6 +80,8 @@ class RetrievedChunk:
     # parent_chunk_index: document-order position of the parent (0, 1, 2…).
     # After score-order dedup, selected parents are re-sorted by this field
     # so the LLM sees them in document order (Article 2 before Article 10).
+    dense_score: float | None = None    # raw Qdrant cosine score (captured for ASTR-O metadata)
+    sparse_score: float | None = None   # raw Qdrant SPLADE dot-product score
 
 
 def _embed_query(query_text: str) -> tuple[list[float], dict[int, float]]:
@@ -107,12 +109,13 @@ def _qdrant_ranks(
     using: str,
     doc_id: str,
     top_k: int,
-) -> dict[str, tuple[int, str, int, str, str | None, str | None, int | None]]:
+) -> dict[str, tuple[int, float, str, int, str, str | None, str | None, int | None]]:
     """
     Fetch retrieval ranks from Qdrant for one query type, scoped to doc_id.
 
-    Returns {chunk_id: (rank, text, page_number, doc_id, parent_text, parent_id, parent_chunk_index)}.
-    Rank is 0-indexed (rank 0 = best). parent_* fields are None for pre-Sprint-16 collections.
+    Returns {chunk_id: (rank, score, text, page_number, doc_id, parent_text, parent_id, parent_chunk_index)}.
+    Rank is 0-indexed (rank 0 = best). score is the raw Qdrant similarity score.
+    parent_* fields are None for pre-Sprint-16 collections.
     """
     response = get_qdrant_client().query_points(
         collection_name=settings.qdrant_collection,
@@ -129,6 +132,7 @@ def _qdrant_ranks(
         payload = point.payload or {}
         result[str(point.id)] = (
             rank,
+            point.score,
             payload.get("text", ""),
             payload.get("page_number", 0),
             payload.get("doc_id", doc_id),
@@ -164,25 +168,17 @@ def _dedup_and_order(chunks: list[RetrievedChunk], top_k: int) -> list[Retrieved
     return deduped
 
 
-def retrieve(
+def _retrieve_fused(
     query_text: str,
     doc_id: str,
-    top_k: int = 5,
-    candidate_k: int = 20,
+    candidate_k: int,
 ) -> list[RetrievedChunk]:
     """
-    Hybrid sparse + dense retrieval with RRF fusion, scoped to a single document.
+    RRF fusion for a single query — returns all candidates sorted by score,
+    before parent dedup and top_k truncation.
 
-    Args:
-        query_text:  Natural language description of the clause to find.
-        doc_id:      Restrict results to this document.
-        top_k:       Number of chunks to return after fusion (goes to LLM).
-        candidate_k: Results to fetch from each retriever before fusion.
-                     Higher = better recall, slower. 20 is a good default.
-
-    Returns:
-        List of RetrievedChunk sorted into document order after parent dedup.
-        Returns empty list if Qdrant is unavailable.
+    Shared by retrieve(), retrieve_with_metadata(), and the multi-query variants
+    so GPU embedding only runs once per query regardless of the caller.
     """
     query_dense, query_sparse = _embed_query(query_text)
 
@@ -210,23 +206,128 @@ def retrieve(
             (1.0 / (RRF_K + dense_rank) if dense_rank is not None else 0.0) +
             (1.0 / (RRF_K + sparse_rank) if sparse_rank is not None else 0.0)
         )
-        _, text, page_number, d_id, parent_text, parent_id, parent_chunk_index = (
+        _, _score, text, page_number, d_id, parent_text, parent_id, parent_chunk_index = (
             dense_results[chunk_id] if chunk_id in dense_results else sparse_results[chunk_id]
         )
         fused.append(RetrievedChunk(
             chunk_id=chunk_id, doc_id=d_id, page_number=page_number, text=text,
             rrf_score=rrf_score, sparse_rank=sparse_rank, dense_rank=dense_rank,
             parent_text=parent_text, parent_id=parent_id, parent_chunk_index=parent_chunk_index,
+            dense_score=dense_results[chunk_id][1] if chunk_id in dense_results else None,
+            sparse_score=sparse_results[chunk_id][1] if chunk_id in sparse_results else None,
         ))
 
     fused.sort(key=lambda x: x.rrf_score, reverse=True)
-    result = _dedup_and_order(fused, top_k)
+    return fused
 
+
+def _retrieve_multi_fused(
+    queries: list[str],
+    doc_id: str,
+    candidate_k: int,
+) -> list[RetrievedChunk]:
+    """
+    Multi-query RRF fusion — fires each query via _retrieve_fused(), then
+    merges candidates by summing RRF scores across queries.
+
+    Returns all merged candidates sorted by summed score, before dedup/truncation.
+    Shared by retrieve_multi() and retrieve_multi_with_metadata().
+    """
+    score_sums: dict[str, float] = {}
+    chunk_map: dict[str, RetrievedChunk] = {}
+
+    for query in queries:
+        for chunk in _retrieve_fused(query, doc_id, candidate_k):
+            score_sums[chunk.chunk_id] = score_sums.get(chunk.chunk_id, 0.0) + chunk.rrf_score
+            if chunk.chunk_id not in chunk_map:
+                chunk_map[chunk.chunk_id] = chunk
+
+    for cid, total in score_sums.items():
+        chunk_map[cid].rrf_score = total
+
+    return sorted(chunk_map.values(), key=lambda x: x.rrf_score, reverse=True)
+
+
+def _build_ranking_metadata(fused: list[RetrievedChunk]) -> list[dict]:
+    """
+    Serialize the full pre-truncation candidate list into ASTR-O ranking metadata.
+    Each entry carries dense/sparse/RRF scores and a human-readable reason string.
+    """
+    return [
+        {
+            "chunk_id": c.chunk_id,
+            "rank": i + 1,
+            "dense_score": round(c.dense_score, 6) if c.dense_score is not None else None,
+            "sparse_score": round(c.sparse_score, 6) if c.sparse_score is not None else None,
+            "rrf_score": round(c.rrf_score, 6),
+            "dense_rank": c.dense_rank,
+            "sparse_rank": c.sparse_rank,
+            "reason_for_rank": (
+                f"Dense: {c.dense_score:.4f} (rank {c.dense_rank}), "
+                f"Sparse: {c.sparse_score:.4f} (rank {c.sparse_rank}) "
+                f"→ RRF: {c.rrf_score:.6f}"
+                if c.dense_score is not None and c.sparse_score is not None
+                else f"RRF: {c.rrf_score:.6f} (single-signal)"
+            ),
+        }
+        for i, c in enumerate(fused)
+    ]
+
+
+def retrieve(
+    query_text: str,
+    doc_id: str,
+    top_k: int = 5,
+    candidate_k: int = 20,
+) -> list[RetrievedChunk]:
+    """
+    Hybrid sparse + dense retrieval with RRF fusion, scoped to a single document.
+
+    Args:
+        query_text:  Natural language description of the clause to find.
+        doc_id:      Restrict results to this document.
+        top_k:       Number of chunks to return after fusion (goes to LLM).
+        candidate_k: Results to fetch from each retriever before fusion.
+                     Higher = better recall, slower. 20 is a good default.
+
+    Returns:
+        List of RetrievedChunk sorted into document order after parent dedup.
+        Returns empty list if Qdrant is unavailable.
+    """
+    fused = _retrieve_fused(query_text, doc_id, candidate_k)
+    if not fused:
+        return []
+    result = _dedup_and_order(fused, top_k)
     logger.debug(
         "[retriever] doc=%s query='%s...' → %d candidates, %d unique parents (doc order)",
         doc_id, query_text[:40], len(fused), len(result),
     )
     return result
+
+
+def retrieve_with_metadata(
+    query_text: str,
+    doc_id: str,
+    top_k: int = 5,
+    candidate_k: int = 20,
+) -> tuple[list[RetrievedChunk], list[dict]]:
+    """
+    Same as retrieve() but also returns the full pre-truncation ranking metadata
+    for ASTR-O span instrumentation.
+
+    Returns:
+        (deduped_chunks_in_doc_order, all_ranked_chunks_metadata)
+    """
+    fused = _retrieve_fused(query_text, doc_id, candidate_k)
+    if not fused:
+        return [], []
+    result = _dedup_and_order(fused, top_k)
+    ranking_metadata = _build_ranking_metadata(fused)
+    logger.debug(
+        "[retriever] doc=%s query='%s...' → %d candidates, %d unique parents (doc order)",
+        doc_id, query_text[:40], len(fused), len(result),
+    )
+    return result, ranking_metadata
 
 
 def retrieve_multi(
@@ -248,24 +349,33 @@ def retrieve_multi(
     Only for categories in CUAD_ALT_QUERIES (15 hard categories). The
     agent falls back to plain retrieve() for all other categories.
     """
-    score_sums: dict[str, float] = {}
-    metadata: dict[str, RetrievedChunk] = {}
-
-    for query in queries:
-        for chunk in retrieve(query_text=query, doc_id=doc_id, top_k=candidate_k, candidate_k=candidate_k):
-            score_sums[chunk.chunk_id] = score_sums.get(chunk.chunk_id, 0.0) + chunk.rrf_score
-            if chunk.chunk_id not in metadata:
-                metadata[chunk.chunk_id] = chunk
-
-    # Update scores in-place and sort — avoids rebuilding every RetrievedChunk
-    for cid, total in score_sums.items():
-        metadata[cid].rrf_score = total
-    merged = sorted(metadata.values(), key=lambda x: x.rrf_score, reverse=True)
-
+    merged = _retrieve_multi_fused(queries, doc_id, candidate_k)
     result = _dedup_and_order(merged, top_k)
-
     logger.debug(
         "[retriever] multi-query doc=%s queries=%d → %d unique candidates, %d unique parents (doc order)",
         doc_id, len(queries), len(merged), len(result),
     )
     return result
+
+
+def retrieve_multi_with_metadata(
+    queries: list[str],
+    doc_id: str,
+    top_k: int = 5,
+    candidate_k: int = 20,
+) -> tuple[list[RetrievedChunk], list[dict]]:
+    """
+    Same as retrieve_multi() but also returns the full pre-truncation ranking
+    metadata for ASTR-O span instrumentation.
+
+    Returns:
+        (deduped_chunks_in_doc_order, all_ranked_chunks_metadata)
+    """
+    merged = _retrieve_multi_fused(queries, doc_id, candidate_k)
+    result = _dedup_and_order(merged, top_k)
+    ranking_metadata = _build_ranking_metadata(merged)
+    logger.debug(
+        "[retriever] multi-query doc=%s queries=%d → %d unique candidates, %d unique parents (doc order)",
+        doc_id, len(queries), len(merged), len(result),
+    )
+    return result, ranking_metadata

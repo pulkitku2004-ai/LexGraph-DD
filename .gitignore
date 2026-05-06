@@ -43,6 +43,17 @@ samples/
 # Internal / legacy docs
 CONTEXT_old.md
 
+# Dev scratch and prompt files
+c_prompt.md
+lexgraph_astro.md
+
+# ASTR-O test report outputs (ephemeral JSON, not source)
+astr_o_test_report_*.json
+cuad_astr_o_report_*.json
+
+# Dataset samples (downloaded locally, not committed)
+cuad_samples/
+
 # Claude Code local settings
 .claude/
 

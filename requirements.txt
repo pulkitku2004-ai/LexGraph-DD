@@ -32,6 +32,10 @@ langchain-core==1.2.27
 PyMuPDF==1.27.2.2
 python-docx==1.2.0
 
+# ── Observability ─────────────────────────────────────────────────────────────
+opentelemetry-sdk==1.41.1
+opentelemetry-exporter-otlp-proto-http==1.41.1   # only needed when OTEL_ENDPOINT is set
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 numpy==2.4.4

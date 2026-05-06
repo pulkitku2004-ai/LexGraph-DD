@@ -65,9 +65,9 @@ def _verify_api_key(
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> None:
     """Dependency — enforces Bearer token auth when API_KEY is configured."""
-    if not settings.api_key:
+    if not settings.api_key.get_secret_value():
         return  # auth disabled in dev (API_KEY not set)
-    if credentials is None or credentials.credentials != settings.api_key:
+    if credentials is None or credentials.credentials != settings.api_key.get_secret_value():
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 logging.basicConfig(
@@ -185,6 +185,8 @@ def qa(job_id: str, request: QARequest, _: None = Depends(_verify_api_key)) -> Q
             for c in result["citations"]
         ],
         chunks_retrieved=result["chunks_retrieved"],
+        retrieval_metadata=result.get("retrieval_metadata"),
+        enriched_chunks=result.get("enriched_chunks"),
     )
 
 

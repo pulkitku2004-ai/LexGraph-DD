@@ -149,7 +149,7 @@ Terminal agent — reads full state, produces two outputs:
 
 **Structured Report**: A deterministic formatter builds the risk table and contradiction table first (pure Python, no LLM, no failure mode). One LLM call generates an executive summary and recommended actions, which slot into a fixed Markdown template. If the LLM call fails, a template narrative is generated from state counts — `final_report` is **always populated**.
 
-**Interactive Q&A** (`POST /jobs/{id}/qa`): After a job completes, hybrid retrieval runs scoped to that job's documents and returns a grounded answer with page-level citations. Same bge-m3 + RRF pipeline as the Clause Extractor.
+**Interactive Q&A** (`POST /jobs/{id}/qa`): After a job completes, hybrid retrieval runs scoped to that job's documents and returns a grounded answer with page-level citations. Same bge-m3 + RRF pipeline as the Clause Extractor. The Q&A system prompt enforces verbatim-only output — the LLM copies sentences character-for-character from retrieved excerpts without framing language, which is required to pass ASTR-O groundedness validation.
 
 ---
 
@@ -162,7 +162,8 @@ Terminal agent — reads full state, produces two outputs:
 | Knowledge graph | Neo4j 5 (Docker) | Entity graph for cross-document contradiction detection |
 | Embeddings | `BAAI/bge-m3` | Single model: dense (1024-dim CLS, L2-norm) + learned sparse (SPLADE-style) |
 | LLM routing | LiteLLM | Provider abstraction + automatic fallback chain |
-| LLM — extraction | `groq/llama-3.1-8b-instant` → `groq/llama-4-scout-17b` → `ollama/mistral-nemo` | Speed-first, with local fallback |
+| LLM — extraction + reasoning | `gpt-4o-mini` → `ollama/mistral-nemo` (fallback) | All roles use OpenAI primary; Ollama local fallback |
+| Observability | OpenTelemetry (optional) | OTel spans with per-retrieval `retrieval_metadata`; no-op if `OTEL_ENDPOINT` unset |
 | LLM — reasoning | `ollama/mistral-nemo` / OpenRouter free tier | Quality-first for risk scoring and report narrative |
 | PDF parsing | PyMuPDF | Fastest parser, preserves reading order |
 | DOCX parsing | python-docx | Direct XML access, no external tools |
@@ -212,14 +213,25 @@ Hard categories (0–35%) are vocabulary-gap problems — the clause is present 
 
 Evaluated on 192 rows from the same CUAD test set — measures whether the LLM correctly extracts the clause text given retrieved context.
 
+| Model | Found Rate | Token F1 | Cond. F1 | Substring Match | Notes |
+|---|---|---|---|---|---|
+| `llama-3.1-8b-instant` (Groq) | ~83% | ~0.35 | ~0.42 | ~22% | Sprint 23–24 baseline; paraphrases rather than copying verbatim |
+| **`gpt-4o-mini` (OpenAI)** | **87.5%** | **0.540** | **0.617** | **42.7%** | **Sprint 25 — current primary; clean 192-row run, no fallback** |
+
+Switching to `gpt-4o-mini` broke the previous ceiling by **+19.6pp Cond. F1**, confirming the bottleneck was model capability (paraphrasing tendency of llama-3.1-8b-instant), not retrieval or prompt design.
+
+### ASTR-O Integration (Sprint 26)
+
+End-to-end integration with the ASTR-O observability pipeline on 30 CUAD contracts (3 batches × 10 contracts, 5 queries per batch = 15 spans):
+
 | Metric | Value |
 |---|---|
-| Found Rate | ~83% |
-| Token F1 (mean) | ~0.35 |
-| Conditional F1 (when found=True) | ~0.42 |
-| Substring Match | ~22% |
+| Valid spans | 15 / 15 |
+| SAFE verdicts | **13 (86.7%)** |
+| FLAGGED verdicts | 2 |
+| Errors | 0 |
 
-**Extraction ceiling declared at Cond. F1 ≈ 0.42.** The primary limiting factor is the extraction model (llama-3.1-8b-instant) paraphrasing rather than copying verbatim. This is a model capability ceiling, not a retrieval or prompt engineering problem — see [What Was Evaluated](#what-was-evaluated) below.
+ASTR-O's groundedness check requires every word in the answer to appear verbatim in the retrieved chunks. The verbatim-only Q&A prompt (Sprint 26) achieved 86.7% SAFE. The 2 failures were genuine — one contradiction across chunks, one partial verbatim compliance.
 
 ---
 
@@ -256,6 +268,7 @@ Every approach that was tested and either kept or rejected, in the order it was 
 | Extraction hints for 19 categories (Sprint 23) | Confounded | **Kept** | Run was model-mixed (Groq TPD hit → ollama fallback); improvement not cleanly measurable but logically sound |
 | `trim_clause_text()` — strip section headers (Sprint 23) | ±0.003 (noise) | **Kept** | Negligible Token F1 effect, but produces cleaner input for risk scorer and contradiction detector |
 | Verbatim copy instruction in SYSTEM_PROMPT (Sprint 24) | −4.8pp | **Rejected** | "Copy character-for-character, do not paraphrase" confused the model — llama-3.1-8b degraded under the additional constraint. This is a model capability ceiling, not a prompt problem. |
+| Switch extraction primary to `gpt-4o-mini` (Sprint 25) | **+19.6pp** | **Kept** | Cond. F1 0.421 → 0.617. Confirmed the ceiling was model-specific to llama-3.1-8b. Extraction outputs are short (~300 tokens), so OpenAI API cost per job is low. |
 
 ---
 
@@ -265,7 +278,7 @@ This is a working research prototype. Before deploying in a production legal env
 
 | Limitation | Detail |
 |---|---|
-| **Extraction quality ceiling** | Conditional F1 ≈ 0.42 on CUAD. The extraction LLM (llama-3.1-8b-instant) paraphrases rather than copying verbatim. Fixing this requires a larger model (70B+) or a CUAD fine-tuned extraction model — neither is addressable with prompt engineering alone. |
+| **Extraction quality on fallback** | If OpenAI is unavailable, the pipeline falls back to local `ollama/mistral-nemo`. Extraction quality degrades — Ollama's 7B model paraphrases rather than copying verbatim, and the Cond. F1 ceiling for smaller models is ≈ 0.42 vs 0.617 for `gpt-4o-mini`. |
 | **Retrieval ceiling on hard categories** | Most Favored Nation (0%), Non-Compete (35%), Joint IP Ownership (29%) remain low after all enrichment. Root cause: clause vocabulary diverges significantly from category name. Requires contrastive fine-tuning on CUAD (paid GPU). |
 | **In-memory job store** | Jobs live in a Python dict — lost on server restart. A SQLite or Postgres-backed store is needed for production durability. |
 | **Rate-limit dependency** | The extraction pipeline makes ~2,050 LLM calls per 50-document job. Groq's free tier (500k tokens/day on scout-17b) can exhaust mid-run on large batches; the local Ollama fallback is slower and produces lower-quality output. |
@@ -283,7 +296,8 @@ This is a working research prototype. Before deploying in a production legal env
 - Docker (for Qdrant + Neo4j)
 - Python 3.12
 - [Ollama](https://ollama.com) with `mistral-nemo` pulled (`ollama pull mistral-nemo`)
-- A free [Groq API key](https://console.groq.com)
+- An [OpenAI API key](https://platform.openai.com/api-keys) for clause extraction (`gpt-4o-mini`)
+- An optional [Groq API key](https://console.groq.com) for the extraction fallback chain
 
 ### 1. Clone and install
 
@@ -300,7 +314,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env — add your GROQ_API_KEY at minimum
+# Edit .env — add OPENAI_API_KEY (required) and GROQ_API_KEY (fallback)
 ```
 
 ### 3. Start infrastructure
@@ -368,7 +382,7 @@ LexGraph-DD/
 │   ├── core/                        # Settings (pydantic-settings), domain models, GraphState
 │   ├── api/                         # FastAPI endpoints + background job runner
 │   ├── ui/                          # Streamlit interface
-│   └── infrastructure/              # Qdrant + Neo4j client singletons, health check
+│   └── infrastructure/              # Qdrant + Neo4j client singletons, health check, OTel observability
 ├── eval/
 │   ├── cuad_eval.py                 # Retrieval eval harness — Recall@K on CUAD benchmark
 │   ├── e2e_eval.py                  # End-to-end extraction eval (Token F1 + found rate)
@@ -386,11 +400,8 @@ LexGraph-DD/
 
 | Role | Provider | Rationale |
 |---|---|---|
-| Extraction (~2,050 calls/job) | Groq free tier (`llama-3.1-8b-instant`) | ~300ms/call, 6,000 TPM sufficient with semaphore cap |
-| Extraction fallback 1 | `groq/llama-4-scout-17b` | Separate rate-limit bucket from primary model |
-| Extraction fallback 2 | `ollama/mistral-nemo` (local) | Zero rate limit, fully offline, runs on M-series via MPS |
-| Reasoning (report, risk) | `ollama/mistral-nemo` | Unlimited local inference for quality-sensitive passes |
-| Reasoning (small jobs) | OpenRouter free tier | Access to 120B+ models at zero cost, ~200 req/day |
+| Extraction + reasoning (all roles) | `gpt-4o-mini` (OpenAI) | Single model across all roles — consistent output quality. Cond. F1 0.617 for extraction; ASTR-O groundedness requires verbatim output that smaller models fail. |
+| Fallback (offline / outage) | `ollama/mistral-nemo` (local) | Zero rate limit, fully offline, runs on M-series via MPS. Quality lower — Groq removed in Sprint 26 due to paraphrasing causing groundedness failures. |
 
 The fallback chain is handled automatically by LiteLLM — no custom retry logic in the application code.
 

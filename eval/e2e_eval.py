@@ -222,12 +222,11 @@ def extract_with_llm(
     """
     settings = get_settings()
     prompt = build_extraction_prompt(clause_type, retrieved_texts, doc_id)
+    key = _llm_key(prompt)  # always defined — used by both cache check and cache write
 
     # ── Cache check ────────────────────────────────────────────────────────
-    if llm_cache is not None:
-        key = _llm_key(prompt)
-        if key in llm_cache:
-            return _parse_raw(llm_cache[key], clause_type)
+    if llm_cache is not None and key in llm_cache:
+        return _parse_raw(llm_cache[key], clause_type)
 
     # ── LLM call ──────────────────────────────────────────────────────────
     try:
@@ -240,9 +239,8 @@ def extract_with_llm(
             ],
             temperature=0.0,
             max_tokens=300,
-            api_key=settings.groq_api_key or None,
         )
-        raw = (response.choices[0].message.content or "").strip()
+        raw: str = (response.choices[0].message.content or "").strip()  # type: ignore[union-attr]
 
         if llm_cache is not None:
             llm_cache[key] = raw
