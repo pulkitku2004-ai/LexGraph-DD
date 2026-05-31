@@ -149,7 +149,7 @@ Terminal agent — reads full state, produces two outputs:
 
 **Structured Report**: A deterministic formatter builds the risk table and contradiction table first (pure Python, no LLM, no failure mode). One LLM call generates an executive summary and recommended actions, which slot into a fixed Markdown template. If the LLM call fails, a template narrative is generated from state counts — `final_report` is **always populated**.
 
-**Interactive Q&A** (`POST /jobs/{id}/qa`): After a job completes, hybrid retrieval runs scoped to that job's documents and returns a grounded answer with page-level citations. Same bge-m3 + RRF pipeline as the Clause Extractor. The Q&A system prompt enforces verbatim-only output — the LLM copies sentences character-for-character from retrieved excerpts without framing language, which is required to pass ASTR-O groundedness validation.
+**Interactive Q&A** (`POST /jobs/{id}/qa`): After a job completes, hybrid retrieval runs scoped to that job's documents and returns a grounded answer with page-level citations. Same bge-m3 + RRF pipeline as the Clause Extractor. The Q&A system prompt enforces verbatim-only output — the LLM copies sentences character-for-character from retrieved excerpts without framing language.
 
 ---
 
@@ -219,19 +219,6 @@ Evaluated on 192 rows from the same CUAD test set — measures whether the LLM c
 | **`gpt-4o-mini` (OpenAI)** | **87.5%** | **0.540** | **0.617** | **42.7%** | **Sprint 25 — current primary; clean 192-row run, no fallback** |
 
 Switching to `gpt-4o-mini` broke the previous ceiling by **+19.6pp Cond. F1**, confirming the bottleneck was model capability (paraphrasing tendency of llama-3.1-8b-instant), not retrieval or prompt design.
-
-### ASTR-O Integration (Sprint 26)
-
-End-to-end integration with the ASTR-O observability pipeline on 30 CUAD contracts (3 batches × 10 contracts, 5 queries per batch = 15 spans):
-
-| Metric | Value |
-|---|---|
-| Valid spans | 15 / 15 |
-| SAFE verdicts | **13 (86.7%)** |
-| FLAGGED verdicts | 2 |
-| Errors | 0 |
-
-ASTR-O's groundedness check requires every word in the answer to appear verbatim in the retrieved chunks. The verbatim-only Q&A prompt (Sprint 26) achieved 86.7% SAFE. The 2 failures were genuine — one contradiction across chunks, one partial verbatim compliance.
 
 ---
 
@@ -400,7 +387,7 @@ LexGraph-DD/
 
 | Role | Provider | Rationale |
 |---|---|---|
-| Extraction + reasoning (all roles) | `gpt-4o-mini` (OpenAI) | Single model across all roles — consistent output quality. Cond. F1 0.617 for extraction; ASTR-O groundedness requires verbatim output that smaller models fail. |
+| Extraction + reasoning (all roles) | `gpt-4o-mini` (OpenAI) | Single model across all roles — consistent output quality. Cond. F1 0.617 for extraction; verbatim output is required and smaller models fail at this. |
 | Fallback (offline / outage) | `ollama/mistral-nemo` (local) | Zero rate limit, fully offline, runs on M-series via MPS. Quality lower — Groq removed in Sprint 26 due to paraphrasing causing groundedness failures. |
 
 The fallback chain is handled automatically by LiteLLM — no custom retry logic in the application code.

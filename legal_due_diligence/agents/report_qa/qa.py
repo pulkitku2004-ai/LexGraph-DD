@@ -54,11 +54,11 @@ def _retrieve_across_docs(
 
     Calls per-document retrieve_with_metadata() for each doc_id, merges results
     by RRF score, and returns both the final chunk list and the full retrieval
-    metadata (all pre-truncation ranked chunks per doc) for ASTR-O span emission.
+    metadata (all pre-truncation ranked chunks per doc).
 
     Returns:
         (chunks, retrieval_metadata)
-        retrieval_metadata shape matches ASTR-O's expected span structure:
+        retrieval_metadata shape:
           {query, retrieval_method, top_k, retrieved_chunks, all_ranked_chunks, retrieval_timestamp}
     """
     all_chunks: list[RetrievedChunk] = []
@@ -67,7 +67,7 @@ def _retrieve_across_docs(
     for doc_id in doc_ids:
         chunks, ranked = retrieve_with_metadata(question, doc_id, top_k=top_k_per_doc)
         all_chunks.extend(chunks)
-        # Tag each ranked entry with its doc_id so ASTR-O can trace cross-doc conflicts
+        # Tag each ranked entry with its doc_id for cross-doc conflict tracing
         for entry in ranked:
             all_ranked_flat.append({**entry, "doc_id": doc_id})
 

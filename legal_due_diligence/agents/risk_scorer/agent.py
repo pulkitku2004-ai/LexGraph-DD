@@ -21,8 +21,7 @@ Pass 2 — LLM reasoning (gpt-4o-mini, settings.llm_reasoning_model):
 Why gpt-4o-mini for reasoning? (Sprint 26 change from ollama/mistral-nemo)
   Risk flags feed the final brief that a lawyer reads. Wrong risk levels
   have real consequences. Sprint 26 unified all LLM roles to gpt-4o-mini
-  for consistent output quality — Groq/Ollama fallbacks caused paraphrasing
-  that failed ASTR-O groundedness checks. To swap models, set
+  for consistent output quality. To swap models, set
   LLM_REASONING_MODEL in .env — zero code change.
 
 Why not async?

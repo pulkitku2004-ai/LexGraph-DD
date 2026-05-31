@@ -38,8 +38,7 @@ class Settings(BaseSettings):
     #
     #   gpt-4o-mini is the primary: Cond. F1 0.617 vs 0.42 for llama-3.1-8b.
     #   Groq was removed in Sprint 26 — all roles now use gpt-4o-mini for
-    #   consistent output quality; Groq fallback caused ASTR-O groundedness
-    #   failures due to paraphrasing. Ollama is the sole offline fallback.
+    #   consistent output quality. Ollama is the sole offline fallback.
     #
     # REASONING (risk scorer, report narrative, Q&A — low volume):
     #   gpt-4o-mini (default) — same key, separate role.
@@ -51,7 +50,7 @@ class Settings(BaseSettings):
 
     openai_api_key: SecretStr = Field(
         default=SecretStr(""),
-        description="OpenAI API key — primary extraction model (gpt-4o-mini). Required for ASTR-O.",
+        description="OpenAI API key — primary extraction model (gpt-4o-mini).",
     )
     groq_api_key: SecretStr = Field(
         default=SecretStr(""),
@@ -84,7 +83,7 @@ class Settings(BaseSettings):
         description=(
             "Ordered fallback chain for extraction. Sprint 26: Groq removed — "
             "all roles use gpt-4o-mini; Ollama is the sole local fallback with "
-            "no rate limit and no quality mismatch risk for ASTR-O groundedness."
+            "no rate limit."
         ),
     )
 

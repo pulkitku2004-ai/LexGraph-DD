@@ -80,7 +80,7 @@ class RetrievedChunk:
     # parent_chunk_index: document-order position of the parent (0, 1, 2…).
     # After score-order dedup, selected parents are re-sorted by this field
     # so the LLM sees them in document order (Article 2 before Article 10).
-    dense_score: float | None = None    # raw Qdrant cosine score (captured for ASTR-O metadata)
+    dense_score: float | None = None    # raw Qdrant cosine score
     sparse_score: float | None = None   # raw Qdrant SPLADE dot-product score
 
 
@@ -250,7 +250,7 @@ def _retrieve_multi_fused(
 
 def _build_ranking_metadata(fused: list[RetrievedChunk]) -> list[dict]:
     """
-    Serialize the full pre-truncation candidate list into ASTR-O ranking metadata.
+    Serialize the full pre-truncation candidate list into ranking metadata.
     Each entry carries dense/sparse/RRF scores and a human-readable reason string.
     """
     return [
@@ -312,8 +312,7 @@ def retrieve_with_metadata(
     candidate_k: int = 20,
 ) -> tuple[list[RetrievedChunk], list[dict]]:
     """
-    Same as retrieve() but also returns the full pre-truncation ranking metadata
-    for ASTR-O span instrumentation.
+    Same as retrieve() but also returns the full pre-truncation ranking metadata.
 
     Returns:
         (deduped_chunks_in_doc_order, all_ranked_chunks_metadata)
@@ -365,8 +364,7 @@ def retrieve_multi_with_metadata(
     candidate_k: int = 20,
 ) -> tuple[list[RetrievedChunk], list[dict]]:
     """
-    Same as retrieve_multi() but also returns the full pre-truncation ranking
-    metadata for ASTR-O span instrumentation.
+    Same as retrieve_multi() but also returns the full pre-truncation ranking metadata.
 
     Returns:
         (deduped_chunks_in_doc_order, all_ranked_chunks_metadata)
