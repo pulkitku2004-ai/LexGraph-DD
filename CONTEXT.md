@@ -1,7 +1,7 @@
 # LexGraph-DD — Master Context
 
-**Last updated:** 2026-05-02
-**Status:** ACTIVE — Sprint 26 (ASTR-O full integration) complete. Project was closed after Sprint 24 confirmed a llama-3.1-8b extraction ceiling (Cond. F1 ≈ 0.42). Reopened 2026-05-02: Sprint 25 added ASTR-O observability and switched extraction to `gpt-4o-mini` (Cond. F1 0.617, +19.6pp). Sprint 26 unified all LLM roles to gpt-4o-mini and ran a 30-contract CUAD integration test against ASTR-O (13/15 spans SAFE, 86.7%).
+**Last updated:** 2026-05-24
+**Status:** ACTIVE — Sprint 26 (ASTR-O full integration) complete. Project was closed after Sprint 24 confirmed a llama-3.1-8b extraction ceiling (Cond. F1 ≈ 0.42). Reopened 2026-05-02: Sprint 25 added ASTR-O observability and switched extraction to `gpt-4o-mini` (Cond. F1 0.617, +19.6pp). Sprint 26 unified all LLM roles to gpt-4o-mini and ran a 30-contract CUAD integration test against ASTR-O (13/15 spans SAFE, 86.7%). Sprint 27 planned (2026-05-24): log-centric architecture upgrades — LangGraph SqliteSaver checkpoint, SQLite event log for JOB_STORE, content-hash dedup, internal event bus, SSE streaming. Sprint 28 planned (2026-05-31): Hexagonal + Event-Sourced architecture refactor — `core/ports.py` ABCs, `adapters/` directory, `JsonlEventLog`, domain events, crash recovery via log replay.
 
 **Post-close cleanup (2026-04-20):** Low-risk code quality pass — dead field removal (`chunk_overlap`, `reranker_model`), `litellm.suppress_debug_info` centralized to `core/config.py`, duplicate JSON fence-stripping extracted to `core/utils.strip_json_fence()`, `Optional[X]` modernized to `X | None` throughout.
 
@@ -88,6 +88,8 @@ python run_sprint1.py         # re-index after wipe (no pickle — sparse in Qdr
 | 24 | Verbatim prompt test (Cond. F1 0.421→0.373, −4.8pp, rejected) → extraction quality ceiling confirmed → project closed | ✅ DONE (closed) |
 | 25 | ASTR-O compatibility: `retrieval_metadata` per retrieval call, extraction LLM → gpt-4o-mini, minimal OTel, HTTP test runner → `process_lexgraph_span()` | ✅ DONE |
 | 26 | ASTR-O full integration: all LLM roles → gpt-4o-mini (Groq removed), verbatim-only Q&A prompt, 30-contract CUAD integration test → 13/15 SAFE (86.7%) | ✅ DONE |
+| 27 | Log-centric upgrades: LangGraph SqliteSaver checkpoint, SQLite event log for JOB_STORE, content-hash dedup, internal event bus, SSE streaming | 🔜 PLANNED |
+| 28 | Hexagonal + Event-Sourced refactor: `core/ports.py` (IEventLog, IVectorDB, IKnowledgeGraph), `adapters/` directory, `JsonlEventLog`, domain events, crash recovery via log replay | 🔜 PLANNED |
 
 ---
 
@@ -701,6 +703,493 @@ Sprint 26: Groq removed from all roles. ASTR-O groundedness requires verbatim ou
 - **`core/utils.strip_json_fence()`:** shared across clause_extractor, risk_scorer, report_qa; was a copy-pasted 3-liner in three separate parse functions
 - **`X | None` over `Optional[X]`:** Python 3.10+ union syntax used consistently throughout codebase; `Optional` import removed from all modules
 - **`chunk_overlap` and `reranker_model` removed from config:** both were unused — `chunk_overlap` explicitly documented as unused since Sprint 16; `reranker_model` benchmarked and rejected Sprint 17 (−9.5pp), never wired to the retriever
+
+---
+
+## Sprint 27 — Planned: Log-Centric Architecture Upgrades
+
+**Analysis date:** 2026-05-24. After studying Jay Kreps' "The Log" (LinkedIn Engineering), five structural gaps were identified in LexGraph's architecture that map directly to log theory anti-patterns. All five have concrete, low-to-medium-effort fixes. No code has been written yet — this section captures the full theory and implementation plan so it can be executed in a future session.
+
+---
+
+### The Log — Theory Summary
+
+The log is an append-only, totally ordered sequence of records ordered by time. Each record gets a unique sequential log entry number — that number **is** the clock. The log is the authoritative source of truth; every table or index is a derived projection of that history into a useful data structure.
+
+**Core principles:**
+
+- **Log → Table:** apply changes in order → current state (credits/debits → account balance; events → JobRecord)
+- **Table → Log (CDC):** record every mutation as a changelog → replication, audit trail, time-travel
+- **State machine replication:** two identical deterministic processes given the same inputs in the same order produce the same output and end in the same state. Distributed consistency = a consistent log feeding them the same inputs in order
+- **Replica as single number:** `cursor_position + log = entire state of the replica`. A replica can be fully described by the max log entry number it has processed
+- **N×M → N+M:** Without a central log: N sources × M destinations = N×M point-to-point connections. With a log: N+M connections total. Adding a new consumer touches only its connection to the log — not every producer
+- **Log as buffer:** decouples producers from consumers; consumers can fail or restart without slowing the rest of the processing graph
+- **Stream processing = log processing:** a stream processor reads from and writes to logs; produces output at user-controlled frequency without requiring a static snapshot
+- **Log compaction:** remove records whose primary key has a more recent update → log becomes a complete backup of current state without storing full history; Kafka implements this natively
+
+The log's role in a system: sequencing concurrent updates, replication between nodes, commit semantics for writers, restoring failed replicas, external subscription feeds, data rebalancing.
+
+---
+
+### The 5 Gaps Found in LexGraph
+
+**Gap 1 — JOB_STORE is the source of truth, not a derived view (`api/runner.py:48`)**
+
+```python
+JOB_STORE: dict[str, JobRecord] = {}
+```
+
+This dict IS the authoritative state — there is nothing behind it. Server restart wipes every job and every report. The correct model: an append-only event log is the source of truth; JOB_STORE is the materialized current-state view rebuilt from it. Acknowledged as a known limitation in the runner.py docstring and CONTEXT Known Issues table.
+
+**Gap 2 — No pipeline checkpointing — crash = restart from zero (`agents/orchestrator/graph.py`)**
+
+`run_pipeline()` is a single monolithic function: ingest → all 6 LangGraph agents → done. No node-level cursor, no resume point. LangGraph supports `SqliteSaver` as a checkpointer natively, but `build_graph()` is called with no checkpointer argument. Enabling it takes ~10 lines.
+
+**Gap 3 — N×M integration: Sprint 25 ASTR-O violated the integration rule**
+
+Adding ASTR-O as a consumer required modifying 5+ existing files:
+- `clause_extractor/retriever.py` — new `retrieve_with_metadata()` / `retrieve_multi_with_metadata()` variants + `_build_ranking_metadata()`
+- `clause_extractor/agent.py` — switch calls to new variants
+- `report_qa/qa.py` — return `retrieval_metadata` + `enriched_chunks`
+- `api/schemas.py` — new optional fields on `QAResponse`
+- `test_runner_for_astr_o.py` — assemble span dict from new fields
+
+The integration rule says adding a new consumer should create work only to connect it to a single pipeline — not to every producing system. Zero of those files should have changed; ASTR-O should have subscribed to a retrieval event log.
+
+**Gap 4 — No document deduplication (log compaction missing)**
+
+Uploading the same contract twice creates duplicate Qdrant vectors, inflating retrieval noise. Acknowledged in Known Issues. Log compaction fix: content hash as primary key, dedup before embedding. Same primary key (content hash) → latest record wins.
+
+**Gap 5 — Batch pipeline, no incremental output to client**
+
+Extraction is already concurrent internally (`asyncio.gather` per doc × category, `Semaphore(10)`) but all output is accumulated and returned as a batch at the end. The user sees nothing for 10 minutes on a 50-doc job. Stream processing principle: produce output at user-controlled frequency, no static snapshot required.
+
+---
+
+### Upgrade 1 — LangGraph SqliteSaver (checkpoint log)
+
+**Files:** `agents/orchestrator/graph.py`, `api/runner.py` | **Effort:** ~10 lines | **Prerequisite:** none
+
+Every LangGraph node transition is checkpointed to SQLite. On crash or restart, `graph.invoke()` with the same `thread_id` (= `job_id`) resumes from the last completed node — not from ingestion.
+
+```python
+# agents/orchestrator/graph.py
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+def build_graph():
+    graph = StateGraph(GraphState)
+    # ... add_node / add_edge / add_conditional_edges unchanged ...
+    checkpointer = SqliteSaver.from_conn_string("jobs.db")
+    return graph.compile(checkpointer=checkpointer)
+
+# api/runner.py — add config kwarg to graph.invoke()
+result = graph.invoke(
+    {"job_id": job_id, "documents": documents},
+    config={"configurable": {"thread_id": job_id}}
+)
+```
+
+**What this unlocks:**
+- Crash recovery: 50-doc job crashes after 40 min of extraction → resumes from the last completed node
+- Stage replay: re-run `risk_scorer` with new rules on already-extracted clauses by invoking with the same thread_id from the `risks_scored` checkpoint — no re-ingestion, no re-extraction
+- Log principle applied: `job_id (thread_id) + checkpoint DB = entire pipeline state`. Single cursor offset = full replay position. This is exactly "replica described by a single number."
+
+---
+
+### Upgrade 2 — SQLite Event Log for JOB_STORE
+
+**Files:** `api/runner.py` (new `EventLog` class, replace dict usages) | **Effort:** ~150 lines | **Prerequisite:** none
+
+Replace the in-memory `JOB_STORE` dict with an append-only event log. JOB_STORE becomes a derived view rebuilt by replaying events on startup.
+
+**Schema:**
+```sql
+CREATE TABLE IF NOT EXISTS job_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,  -- log entry number / clock
+    job_id  TEXT    NOT NULL,
+    event   TEXT    NOT NULL,
+    payload TEXT    NOT NULL,                   -- JSON blob
+    ts      TEXT    NOT NULL                    -- ISO-8601 timestamp
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_job_id ON job_events(job_id);
+```
+
+**Event types:**
+
+| event | payload fields |
+|---|---|
+| `job_created` | `doc_ids, tmp_dir, created_at` |
+| `doc_ingested` | `doc_id, page_count, chunk_count` |
+| `ingestion_failed` | `doc_id, error` |
+| `pipeline_complete` | `final_report` |
+| `pipeline_error` | `error` |
+
+**Usage pattern:**
+```python
+class EventLog:
+    def append(self, job_id: str, event: str, payload: dict) -> int:
+        # INSERT INTO job_events ... → return rowid (the log entry number)
+        ...
+    def replay(self) -> dict[str, JobRecord]:
+        # SELECT * FROM job_events ORDER BY id → fold into dict[job_id, JobRecord]
+        ...
+
+event_log = EventLog("jobs.db")
+# At startup:
+JOB_STORE = event_log.replay()
+# On any status change instead of direct dict mutation:
+event_log.append(job_id, "pipeline_complete", {"final_report": report})
+```
+
+**Log principle applied:** Log → Table. The event log is the source of truth; JOB_STORE is the materialized current-state projection. Full audit trail: every state transition is timestamped and persisted. Every previous state of every job is recoverable. Server restart is safe.
+
+---
+
+### Upgrade 3 — Content-Hash Deduplication
+
+**Files:** `api/runner.py` (or `ingestion/indexer.py`) | **Effort:** ~30 lines | **Prerequisite:** none
+
+Before ingesting, SHA-256 hash the file bytes. Store `content_hash` in each Qdrant point's payload. On upload, scroll Qdrant for an existing point with that hash. If found, reuse the existing `doc_id` and skip embedding entirely.
+
+```python
+import hashlib
+
+def find_existing_doc(file_bytes: bytes, qdrant_client) -> str | None:
+    content_hash = hashlib.sha256(file_bytes).hexdigest()
+    results, _ = qdrant_client.scroll(
+        collection_name=settings.qdrant_collection,
+        scroll_filter=Filter(must=[FieldCondition(key="content_hash", match=MatchValue(value=content_hash))]),
+        limit=1,
+    )
+    return results[0].payload["doc_id"] if results else None
+
+# In ingestion path:
+existing_doc_id = find_existing_doc(file_bytes, qdrant)
+if existing_doc_id:
+    # reuse — skip load/chunk/embed/index entirely
+    doc_id = existing_doc_id
+else:
+    doc_id = str(uuid.uuid4())
+    # proceed with ingestion, store content_hash in payload
+```
+
+Also requires adding `content_hash` to the Qdrant payload in `indexer.py` at index time.
+
+**Log principle applied:** Log compaction — same primary key (content hash) → latest record wins, duplicate discarded. Eliminates the "same contract uploaded twice" known limitation and the retrieval noise that comes with it.
+
+---
+
+### Upgrade 4 — Internal Event Bus
+
+**Files:** `core/events.py` (new), agent files (add `bus.publish()` calls), `api/main.py` or startup (add `bus.subscribe()` calls) | **Effort:** ~100 lines + migration | **Prerequisite:** none
+
+A thin synchronous event bus. Agents publish events with no knowledge of who consumes them. New consumers register at startup — zero changes to agent code when adding a new consumer.
+
+```python
+# core/events.py
+from collections import defaultdict
+from typing import Callable
+
+class EventBus:
+    def __init__(self):
+        self._handlers: dict[str, list[Callable]] = defaultdict(list)
+
+    def subscribe(self, event_type: str, handler: Callable) -> None:
+        self._handlers[event_type].append(handler)
+
+    def publish(self, event_type: str, payload: dict) -> None:
+        for h in self._handlers[event_type]:
+            h(payload)
+
+bus = EventBus()  # module-level singleton
+```
+
+**Publish calls to add in agents (one line each):**
+```python
+# clause_extractor/agent.py — after each successful extraction
+bus.publish("clause_extracted", {
+    "job_id": job_id, "doc_id": doc_id,
+    "clause": clause.model_dump(), "retrieval_metadata": metadata
+})
+
+# risk_scorer/agent.py — after each flag
+bus.publish("risk_flagged", {"job_id": job_id, "flag": flag.model_dump()})
+
+# contradiction_detector/agent.py — after each contradiction
+bus.publish("contradiction_found", {"job_id": job_id, "contradiction": c.model_dump()})
+```
+
+**Consumer registration replaces Sprint 25 plumbing (in startup, not in agent files):**
+```python
+# ASTR-O — instead of adding retrieval_metadata plumbing through 5 files:
+bus.subscribe("clause_extracted", astro_handler.on_retrieval_event)
+
+# Future consumers — zero changes to any agent file:
+bus.subscribe("risk_flagged", lambda e: slack.post(e) if e["flag"]["risk_level"] == "high" else None)
+bus.subscribe("contradiction_found", compliance_exporter.on_contradiction)
+```
+
+**Log principle applied:** N×M → N+M. Adding a new consumer = one `bus.subscribe()` call in one file. At LexGraph's current scale a synchronous Python bus is sufficient. Upgrade path: swap for Redis Pub/Sub to get cross-process fanout; swap for Kafka if throughput requires partitioned logs.
+
+---
+
+### Upgrade 5 — SSE Streaming for Live Extraction Results
+
+**Files:** `api/main.py` (new endpoint), `ui/app.py` (live table component) | **Effort:** ~80 lines | **Prerequisite:** Upgrade 4 (event bus)
+
+New endpoint `GET /jobs/{id}/stream` returns Server-Sent Events. The event bus feeds an `asyncio.Queue` per connected client. Extracted clauses and risk flags stream to the client as they complete — no waiting for the full pipeline.
+
+```python
+# api/main.py
+from sse_starlette.sse import EventSourceResponse
+
+@app.get("/jobs/{job_id}/stream")
+async def stream_job(job_id: str, _: None = Depends(_verify_api_key)):
+    async def generator():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def on_event(payload: dict) -> None:
+            if payload.get("job_id") == job_id:
+                asyncio.get_event_loop().call_soon_threadsafe(queue.put_nowait, payload)
+
+        bus.subscribe("clause_extracted", on_event)
+        bus.subscribe("risk_flagged", on_event)
+        bus.subscribe("contradiction_found", on_event)
+
+        while True:
+            event = await queue.get()
+            if event.get("event") == "pipeline_complete":
+                yield {"data": json.dumps(event)}
+                break
+            yield {"data": json.dumps(event)}
+
+    return EventSourceResponse(generator())
+```
+
+Streamlit UI update: replace the polling `GET /jobs/{id}` loop with an SSE listener that renders a live clause table, highlighting HIGH risks in red as each `risk_flagged` event arrives.
+
+**Log principle applied:** Stream processing — produce output at user-controlled frequency, no static snapshot required. The user sees extraction results for doc 1 while doc 2 is still being processed.
+
+---
+
+### Upgrade Priority Order
+
+| # | Upgrade | Effort | Impact | Files Changed |
+|---|---|---|---|---|
+| 1 | LangGraph SqliteSaver | ~10 lines | Crash recovery, stage replay | `orchestrator/graph.py`, `api/runner.py` |
+| 3 | Content-hash dedup | ~30 lines | Eliminates known dupe limitation | `api/runner.py`, `ingestion/indexer.py` |
+| 2 | SQLite event log | ~150 lines | Job durability across restarts | `api/runner.py` |
+| 4 | Internal event bus | ~100 + migration | All future consumers free, ASTR-O decoupled | `core/events.py` + agent publish calls |
+| 5 | SSE streaming | ~80 lines | Live progress UX | `api/main.py`, `ui/app.py` |
+
+**Start with Upgrade 1.** LangGraph already has the machinery — `SqliteSaver` is a first-party LangGraph package. One argument to `graph.compile()`, one `config=` kwarg to `graph.invoke()`. A 50-doc job that crashes after 40 minutes of extraction resumes from the last node instead of restarting from ingestion. Everything else is additive.
+
+---
+
+## Sprint 28 — Planned: Hexagonal + Event-Sourced Architecture
+
+**Analysis date:** 2026-05-31. After studying FLARE's architecture (spacecraft telemetry anomaly detection) and the underlying theory (Hexagonal Architecture — Cockburn; DDIA Ch11 — Kleppmann; The Log — Kreps), three architectural patterns were identified as directly applicable to LexGraph. Sprint 28 applies all three in a phased migration. No code has been written yet — this section captures the full plan so it can be executed in a future session.
+
+**Prerequisite note:** Sprint 27 and Sprint 28 target overlapping concerns (both address JOB_STORE durability and event persistence). Sprint 28's `JsonlEventLog` supersedes Sprint 27's `SQLite event log` — they solve the same Gap 2 with different mechanisms. Sprint 27 Upgrades 1 (SqliteSaver), 3 (content-hash dedup), and 5 (SSE streaming) remain independent and can be applied alongside Sprint 28. Sprint 27 Upgrade 4 (event bus) is absorbed into Sprint 28's event-driven pipeline.
+
+---
+
+### The Three Patterns and What Question Each Answers
+
+These are not competing choices. They answer different questions at different levels and stack cleanly:
+
+| Pattern | Question | Where It Sits |
+|---|---|---|
+| **Hexagonal Architecture (Ports & Adapters)** | What is allowed to know about what? | Structure — the container |
+| **Event-Driven Pipeline** | How does computation flow inside the container? | Behavior — inside the container |
+| **Event Sourcing (Log-Based State)** | How is state preserved at the persistence boundary? | Persistence — the adapter boundary |
+
+---
+
+### Current Architecture: What Is Broken
+
+**Gap A — JOB_STORE is the source of truth (`api/runner.py`)**
+```python
+JOB_STORE: dict[str, JobRecord] = {}
+```
+Mutable in-memory dict. Server restart wipes every job and every report. No history, no audit trail, no recovery.
+
+**Gap B — No crash recovery for the pipeline**
+`run_pipeline()` is monolithic: ingest → 6 agents → done. No checkpoint. Crash after 40 minutes of extraction on a 50-doc job = restart from ingestion.
+
+**Gap C — Infrastructure imported directly inside agents (N×M coupling)**
+`get_qdrant_client()` inside `retriever.py`. `neo4j_client.py` imported inside `entity_mapper/agent.py` and `contradiction_detector/agent.py`. Swapping the vector store requires touching agent files. Sprint 25's ASTR-O integration required modifying 5 existing files because there was no clean boundary.
+
+**Gap D — State transitions leave no trace**
+`GraphState` is mutated in-place via LangGraph's dict merging. There is no record of what changed, when, or in what order. The only artifact is the final `final_report` string.
+
+---
+
+### Target Architecture
+
+**`GraphState` stays as the LangGraph interface** — LangGraph requires it. What changes: it becomes a *materialized view* derived from the event log, not the source of truth.
+
+**`runner.py` becomes the composition root** — the only file that instantiates adapters and injects them. Agents import ports only, never adapters, never infrastructure.
+
+```
+core/ports.py        — ABCs (IEventLog, IVectorDB, IKnowledgeGraph)
+                       BOUNDARY: no qdrant, no neo4j, no litellm imports here
+
+adapters/            — Implementations of the ABCs
+  qdrant_adapter.py  — QdrantAdapter implements IVectorDB
+  neo4j_adapter.py   — Neo4jAdapter implements IKnowledgeGraph
+  jsonl_event_log.py — JsonlEventLog implements IEventLog
+                       BOUNDARY: no LangGraph state imports here
+
+agents/              — Orchestration only. Imports ports, not adapters.
+                       BOUNDARY: inject adapters from runner.py, never instantiate here
+
+api/runner.py        — Composition root: instantiates adapters, injects into agents, creates
+                       JsonlEventLog per job, wires everything together
+```
+
+---
+
+### Port Definitions (`core/ports.py`)
+
+```python
+from abc import ABC, abstractmethod
+
+class IEventLog(ABC):
+    @abstractmethod
+    def append(self, event: DomainEvent) -> None: ...
+    @abstractmethod
+    def replay(self, job_id: str) -> list[DomainEvent]: ...
+    @abstractmethod
+    def fold(self, job_id: str) -> GraphState: ...
+
+class IVectorDB(ABC):
+    @abstractmethod
+    def upsert(self, points: list[EmbeddedChunk]) -> None: ...
+    @abstractmethod
+    def query(self, dense: list[float], sparse: dict, doc_id: str, top_k: int) -> list[Chunk]: ...
+
+class IKnowledgeGraph(ABC):
+    @abstractmethod
+    def merge_clause(self, clause: ExtractedClause) -> None: ...
+    @abstractmethod
+    def find_contradictions(self, doc_ids: list[str]) -> list[Contradiction]: ...
+```
+
+---
+
+### Domain Events (`core/events.py`)
+
+Immutable frozen dataclasses. The log stores these in order. `fold()` consumes them in order to reconstruct `GraphState`.
+
+```python
+@dataclass(frozen=True)
+class JobStarted:
+    job_id: str
+    file_paths: list[str]
+    timestamp: datetime
+
+@dataclass(frozen=True)
+class DocumentIngested:
+    job_id: str
+    doc_id: str
+    page_count: int
+    chunk_count: int
+    timestamp: datetime
+
+@dataclass(frozen=True)
+class ClauseExtracted:
+    job_id: str
+    document_id: str
+    clause_type: str
+    found: bool
+    confidence: float
+    timestamp: datetime
+
+@dataclass(frozen=True)
+class RiskFlagRaised:
+    job_id: str
+    document_id: str
+    clause_type: str
+    risk_level: str
+    timestamp: datetime
+
+@dataclass(frozen=True)
+class ContradictionDetected:
+    job_id: str
+    clause_type: str
+    document_id_a: str
+    document_id_b: str
+    timestamp: datetime
+
+@dataclass(frozen=True)
+class ReportGenerated:
+    job_id: str
+    timestamp: datetime
+```
+
+`fold(events) → GraphState`: apply events in append order to reconstruct current state. On crash → replay → resume. The `job_id.jsonl` file is the source of truth; `GraphState` in memory is the projection.
+
+---
+
+### What Does NOT Change
+
+| Component | Why untouched |
+|---|---|
+| 6 agent node bodies and their logic | Ports are injected — node code calls port methods, not infrastructure directly |
+| LangGraph topology (6 nodes, conditional routing) | Unchanged — same `add_node` / `add_edge` / `add_conditional_edges` |
+| Retrieval pipeline (bge-m3, RRF, parent-child, CUAD_ALT_QUERIES) | Lives inside `QdrantAdapter.query()` — same Qdrant calls, same parameters |
+| CUAD eval harness | Calls retriever directly, bypasses adapters; unchanged |
+| FastAPI endpoints and schemas | Unchanged |
+| Streamlit UI | Unchanged |
+| R@3 = 68.3% benchmark | `QdrantAdapter` must be a faithful forwarding wrapper — any query parameter change would regress this |
+
+---
+
+### Migration Phases
+
+**Each phase ends with the smoke test passing. Do not proceed to the next phase until the current phase is verified.**
+
+**Phase 1 — Define ports and adapters, wire nothing** (~30 lines)
+- Create `core/ports.py` with three ABCs
+- Create `adapters/` directory
+- Move `qdrant_client.py`, `neo4j_client.py` into `adapters/` as `QdrantAdapter`, `Neo4jAdapter`
+- Create `JsonlEventLog` that writes `{job_id}.jsonl`
+- Existing agent code unchanged — no imports modified yet
+- **Smoke test:** still passes. R@3: not benchmarked (no retrieval code changed)
+
+**Phase 2 — Wire IEventLog into the orchestrator** (~50 lines)
+- `runner.py` instantiates `JsonlEventLog` per job
+- Orchestrator emits `JobStarted` on job creation
+- On crash and restart: `fold()` reconstructs `GraphState` from JSONL log, `graph.invoke()` resumes
+- Agents unchanged
+- **Smoke test:** still passes. **Crash recovery check:** kill process mid-job, restart, confirm state reconstructed correctly from JSONL
+
+**Phase 3 — Wire IVectorDB and IKnowledgeGraph into agents** (~80 lines)
+- Replace `get_qdrant_client()` calls in `retriever.py` with `IVectorDB` port
+- Replace `neo4j_client` calls in `entity_mapper/agent.py` and `contradiction_detector/agent.py` with `IKnowledgeGraph` port
+- Inject adapters from `runner.py` (composition root) — no agent instantiates infrastructure
+- **Critical:** `QdrantAdapter.query()` must forward identical parameters to `query_points()` — no semantic change allowed
+- **Smoke test:** still passes. **Benchmark:** run `cuad_eval.py --n 400` to verify R@3 = 68.3% ± noise
+
+**Phase 4 — Emit domain events from agents** (~60 lines)
+- Each agent emits the relevant `DomainEvent` to `IEventLog` after completing its work
+- `ClauseExtracted` after each extraction, `RiskFlagRaised` after each flag, `ContradictionDetected` per contradiction, `ReportGenerated` at pipeline end
+- Additive — no existing logic removed or modified
+- **Smoke test:** still passes. **Verification:** inspect `{job_id}.jsonl` — events appear in correct order with correct payloads
+
+---
+
+### Migration Risk Summary
+
+| Phase | Risk | Primary concern |
+|---|---|---|
+| 1 | **Low** | Pure structural — zero behavior change |
+| 2 | **Medium** | First real behavior change; crash recovery path must be verified explicitly |
+| 3 | **Medium** | Adapter must not silently alter Qdrant query parameters — R@3 regression would be the symptom |
+| 4 | **Low** | Purely additive — no existing code path modified |
+
+**Highest risk:** Phase 3 adapter wiring. If `QdrantAdapter.query()` changes `query_points()` call semantics (different `candidate_k`, missing `using=` parameter, altered filter), retrieval quality regresses. Run the full CUAD eval at the end of Phase 3 before proceeding.
 
 ---
 
